@@ -636,7 +636,7 @@ CONF
 
 if [ "$SKIP_APT" = 0 ]; then
     head_ "Installing the rest"
-    PKGS=(mumble-server avahi-daemon iw rsync)
+    PKGS=(mumble-server avahi-daemon iw rsync sqlite3)
     if [ "$INSTALL_EMACS" = yes ];  then PKGS+=(emacs-nox); fi
     if [ "$INSTALL_K6SM" = yes ];   then PKGS+=(git); fi
     say "${PKGS[*]}"
@@ -848,9 +848,10 @@ ini_set "$MS_TMP" bandwidth       "$MUMBLE_BANDWIDTH"
 # Opus whatever connects. One old client otherwise drops the whole server to
 # CELT, which costs CPU a small board does not have and sounds worse.
 ini_set "$MS_TMP" opusthreshold   0
-# The server writes its log into SQLite, and those writes are what wears out
-# an SD card. Keep none.
-ini_set "$MS_TMP" logdays         0
+# The server keeps log entries in its SQLite database, and those writes are
+# what wears out an SD card. -1 disables that logging; 0 does NOT mean "none"
+# here, it means KEEP FOREVER, which is the opposite of what is wanted.
+ini_set "$MS_TMP" logdays         -1
 # Nothing here announces itself to the public server list.
 ini_set "$MS_TMP" registerName    ""
 ini_set "$MS_TMP" registerUrl     ""
@@ -1236,6 +1237,93 @@ INITEL
 fi
 
 # --------------------------------------------------------------------------
+# Trusting the server's certificate
+# --------------------------------------------------------------------------
+#
+# A Mumble server generates its own certificate, which no authority has
+# signed, so a client meeting it for the first time raises a modal dialog
+# asking whether to trust it. At the operator's end somebody clicks yes. At
+# the radio there is nobody, and no screen: the dialog opens on a display
+# that exists only inside Xvfb, Mumble waits on it forever, and all that can
+# be seen from outside is a client that runs and never connects.
+#
+# A client that already holds the server's certificate digest skips the
+# question (ServerHandler::setSslErrors calls proceedAnyway), so the digest
+# is put there in advance. It is the SHA-1 of the DER form of the
+# certificate, lower case hex, which is what Mumble compares against.
+
+mumble_db_path() {
+    local d
+    for d in "$OP_HOME/.local/share/Mumble" "$OP_HOME/.config/Mumble" "$OP_HOME"; do
+        if [ -f "$d/.mumble.sqlite" ]; then printf '%s' "$d/.mumble.sqlite"; return 0; fi
+        if [ -f "$d/mumble.sqlite" ];  then printf '%s' "$d/mumble.sqlite";  return 0; fi
+    done
+    # Not created yet: this is where Mumble would put it.
+    printf '%s' "$OP_HOME/.local/share/Mumble/mumble.sqlite"
+}
+
+trust_server_cert() {
+    local db digest der waited=0 group
+    group=$(id -gn "$OP_USER")
+
+    # The server has to be listening before its certificate can be read.
+    if have ss; then
+        while [ "$waited" -lt 30 ]; do
+            if ss -lnt 2>/dev/null | grep -q ":$MUMBLE_PORT "; then break; fi
+            sleep 1
+            waited=$((waited + 1))
+        done
+    else
+        sleep 3
+    fi
+
+    # Kept in a file rather than a pipeline, so that "no certificate at all"
+    # can be told apart from one that happens to hash. An empty pipeline
+    # hashes to da39a3ee..., the SHA-1 of nothing, which looks like a
+    # perfectly good digest and would be stored as one.
+    # The || true matters too: under pipefail a refused connection here would
+    # otherwise end the whole script.
+    der=$(mktemp)
+    echo | openssl s_client -connect "127.0.0.1:$MUMBLE_PORT" 2>/dev/null \
+         | openssl x509 -outform DER > "$der" 2>/dev/null || true
+
+    if [ ! -s "$der" ]; then
+        rm -f "$der"
+        warn "Could not read the Mumble server's certificate. The radio's client"
+        warn "will stop on a dialog asking whether to trust it, which nothing"
+        warn "here can answer. Check that $MS_SERVICE is running, then re-run."
+        return 0
+    fi
+
+    digest=$(sha1sum < "$der" | awk '{print $1}')
+    rm -f "$der"
+
+    if ! printf '%s' "$digest" | grep -qE '^[0-9a-f]{40}$'; then
+        warn "The server's certificate did not hash to anything usable."
+        return 0
+    fi
+
+    if ! have sqlite3; then
+        warn "sqlite3 is not installed; cannot pre-trust the server certificate."
+        return 0
+    fi
+
+    db=$(mumble_db_path)
+    install -d -o "$OP_USER" -g "$group" -m 0755 "$(dirname "$db")"
+
+    # Written as the operator, so the file Mumble owns stays owned by them.
+    if sudo -u "$OP_USER" sqlite3 "$db" \
+        "CREATE TABLE IF NOT EXISTS \`cert\` (\`id\` INTEGER PRIMARY KEY AUTOINCREMENT, \`hostname\` TEXT, \`port\` INTEGER, \`digest\` TEXT);
+         CREATE UNIQUE INDEX IF NOT EXISTS \`cert_host_port\` ON \`cert\`(\`hostname\`,\`port\`);
+         REPLACE INTO \`cert\` (\`hostname\`,\`port\`,\`digest\`) VALUES ('127.0.0.1',$MUMBLE_PORT,'$digest');" 2>/dev/null
+    then
+        ok "trusted    the server's certificate (${digest:0:16}...) in $db"
+    else
+        warn "Could not write the server certificate digest to $db."
+    fi
+}
+
+# --------------------------------------------------------------------------
 # Start everything
 # --------------------------------------------------------------------------
 
@@ -1246,6 +1334,11 @@ systemctl enable rigctld.service mumble-radio.service >/dev/null 2>&1 || true
 
 systemctl restart "$MS_SERVICE" || warn "$MS_SERVICE did not start."
 systemctl restart rigctld.service || warn "rigctld did not start."
+
+# The radio's client will not connect until it trusts the server's
+# certificate, and it cannot be asked. See trust_server_cert above.
+trust_server_cert
+
 systemctl restart mumble-radio.service || warn "mumble-radio did not start."
 
 # The Mumble client waits five seconds for the server, and Mumble's Qt

@@ -509,11 +509,53 @@ What you are likely to see:
 | `Cannot open display` / `Xvfb failed` | `sudo apt install xvfb`, or set `MUMBLE_DISPLAY="offscreen"` in `/etc/ham-radio-pi/setup.conf` and re-run. |
 | Nothing at all, and it does not exit | It is stopped on a wizard. Check `lastupdate=5` is in `~/.config/Mumble/Mumble.conf` and that `~/Documents/MumbleAutomaticCertificateBackup.p12` exists. |
 | `Server connection failed` or a rejected name | The server is not up yet, or the name clashes with your own client's. They must differ. |
+| Nothing at all after `ServerHandler: TLS cipher preference` | It is stopped on the certificate dialog &mdash; see below. |
 | `Unknown PCM` and `snd_pcm_open(...): No such file or directory` | The device name in `Mumble.conf` must be **quoted** &mdash; see below. |
 | `ALSA lib ... cannot open` | The capture or playback device in `Mumble.conf` is not what `arecord -l` lists. |
 
 When it works, it prints nothing much and stays running. Stop it with `C-c`
 and `sudo systemctl start mumble-radio`.
+
+### Trusting the server's certificate
+
+A Mumble server generates its own certificate, and no authority has signed it.
+A client meeting it for the first time raises a modal dialog asking whether to
+trust it. At your desk you click yes. At the radio there is nobody to click,
+and the dialog opens on a display that exists only inside Xvfb, so Mumble waits
+on it **forever**.
+
+From outside, all you see is a client that runs, costs no CPU, logs no error
+and never appears on the server. The last line in its log is
+`ServerHandler: TLS cipher preference is ...` and then nothing. That silence is
+the dialog.
+
+The script prevents it by storing the server's certificate digest in Mumble's
+own database before the client first runs &mdash; which is what a client that
+has already accepted a certificate holds, and what makes Mumble skip the
+question. By hand:
+
+```
+sudo apt install sqlite3
+DIGEST=$(echo | openssl s_client -connect 127.0.0.1:64738 2>/dev/null \
+         | openssl x509 -outform DER | sha1sum | awk '{print $1}')
+
+sudo systemctl stop mumble-radio
+sudo -u radio sqlite3 /home/radio/.local/share/Mumble/mumble.sqlite \
+  "CREATE TABLE IF NOT EXISTS cert (id INTEGER PRIMARY KEY AUTOINCREMENT,
+     hostname TEXT, port INTEGER, digest TEXT);
+   CREATE UNIQUE INDEX IF NOT EXISTS cert_host_port ON cert(hostname,port);
+   REPLACE INTO cert (hostname,port,digest) VALUES ('127.0.0.1',64738,'$DIGEST');"
+sudo systemctl start mumble-radio
+```
+
+The digest is the SHA-1 of the DER form of the certificate, lower case hex,
+which is what Mumble compares against. If the database is not where that
+command looks, try `~/.config/Mumble/` and `~/`: Mumble uses the first
+`mumble.sqlite` it finds along that path.
+
+Give the server a new certificate and the digest changes, at which point the
+radio's client stops connecting until it is stored again. Re-running the script
+does that for you.
 
 ### Never edit Mumble.conf while the client is running
 
