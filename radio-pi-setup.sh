@@ -269,9 +269,22 @@ fi
 # the real list of radios this Hamlib supports and the real list of sound
 # devices this Pi has.
 
+# Command-line packages: no recommends, to keep a Lite image lean.
 apt_install() {
     if [ "$SKIP_APT" = 1 ]; then note "skipping apt (--skip-apt): $*"; return 0; fi
     DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends "$@"
+}
+
+# Graphical packages: recommends INCLUDED, deliberately. Mumble is a Qt
+# program, and on a Lite image the libraries its xcb platform plugin needs
+# arrive as recommends of the Qt runtime rather than as hard dependencies.
+# Installed lean, Mumble dies at startup with "could not load the Qt platform
+# plugin xcb" -- which on a headless machine looks like a client that simply
+# never connects. The extra packages are disk space; this is not the place to
+# save it.
+apt_install_gui() {
+    if [ "$SKIP_APT" = 1 ]; then note "skipping apt (--skip-apt): $*"; return 0; fi
+    DEBIAN_FRONTEND=noninteractive apt-get install -y "$@"
 }
 
 if [ "$SKIP_APT" = 0 ]; then
@@ -603,12 +616,16 @@ CONF
 
 if [ "$SKIP_APT" = 0 ]; then
     head_ "Installing the rest"
-    PKGS=(mumble mumble-server avahi-daemon iw rsync)
-    if [ "$MUMBLE_DISPLAY" = xvfb ]; then PKGS+=(xvfb); fi
+    PKGS=(mumble-server avahi-daemon iw rsync)
     if [ "$INSTALL_EMACS" = yes ];  then PKGS+=(emacs-nox); fi
     if [ "$INSTALL_K6SM" = yes ];   then PKGS+=(git); fi
     say "${PKGS[*]}"
     apt_install "${PKGS[@]}"
+
+    GUI_PKGS=(mumble)
+    if [ "$MUMBLE_DISPLAY" = xvfb ]; then GUI_PKGS+=(xvfb); fi
+    say "${GUI_PKGS[*]} (with recommends)"
+    apt_install_gui "${GUI_PKGS[@]}"
 fi
 
 have mumble || die "The Mumble client did not install."
@@ -1203,6 +1220,18 @@ systemctl restart mumble-radio.service || warn "mumble-radio did not start."
 # startup on a Zero 2W is not instant.
 sleep 12
 
+# "Running" is not the same as "connected": a Mumble stopped on a dialog no
+# one can see, or one that cannot reach the server, is a live process that
+# carries no audio. Wait for the client's own connection to appear.
+say "waiting for the radio's client to reach the server"
+CONNECTED=0
+for _ in $(seq 1 20); do
+    if have ss && ss -tn state established 2>/dev/null | grep -q ":$MUMBLE_PORT\b"; then
+        CONNECTED=1; break
+    fi
+    sleep 3
+done
+
 # --------------------------------------------------------------------------
 # Check it
 # --------------------------------------------------------------------------
@@ -1242,9 +1271,25 @@ else
 fi
 
 if have ss && ss -lnt 2>/dev/null | grep -q ":$MUMBLE_PORT "; then
-    ok "listening  Mumble on port $MUMBLE_PORT"
+    ok "listening  Mumble server on port $MUMBLE_PORT"
 else
     warn "Nothing is listening on Mumble's port $MUMBLE_PORT."
+    FAILED=1
+fi
+
+if [ "$CONNECTED" = 1 ]; then
+    ok "connected  the radio's client is on the server, so audio can flow"
+else
+    warn "The Mumble client is running but never reached the server, so no"
+    warn "audio will pass. The last of its log:"
+    journalctl -u mumble-radio.service -n 20 --no-pager 2>/dev/null | sed 's/^/     /' >&2 || true
+    warn ""
+    warn "Run it by hand to see what it says:"
+    warn "  sudo systemctl stop mumble-radio"
+    warn "  sudo -u $OP_USER HOME=$OP_HOME $MUMBLE_EXEC"
+    warn ""
+    warn "\"Could not load the Qt platform plugin\" means a missing library:"
+    warn "  sudo apt install --reinstall mumble"
     FAILED=1
 fi
 

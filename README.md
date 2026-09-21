@@ -471,6 +471,7 @@ the transmitter down.
 | --- | --- |
 | `rigctld` running, radio does not answer | Radio off, wrong serial speed, or the radio's CAT menu set to something else than the Hamlib model expects. `journalctl -u rigctld -n 40`. |
 | `rigctld` fails at boot but works by hand | The serial adapter had not enumerated yet. Use the `/dev/serial/by-id/...` name and re-run the script. |
+| Mumble client runs but never connects | Usually a missing Qt library: `sudo apt install --reinstall mumble`. See below &mdash; this one looks like nothing at all is wrong. |
 | Mumble client restarts over and over | Its sound device is missing or taken. `journalctl -u mumble-radio -n 40`. Check `arecord -l` still lists the card, and that nothing else has it open. |
 | No audio either way | The server is not reachable: check port 64738 **TCP and UDP**. |
 | Audio breaks up | Raise the jitter buffer 10 ms at a time, at the receiving end. |
@@ -481,6 +482,37 @@ the transmitter down.
 | First syllable clipped | Same: voice activation instead of Push To Talk. |
 | Hum on transmit | A ground loop. That wants an isolating interface, not a software fix. |
 | Everything worked, then the Pi got slow | Check free memory. On a Zero 2W, Mumble, Xvfb and Emacs together are most of 512MB. |
+
+### The radio-end client is the part that hides its failures
+
+Everything else here either works or says why. The Mumble client is a
+graphical program running where nothing can draw, so its failures are silent:
+`systemctl` reports it `active (running)` whether it is carrying audio, sitting
+on a dialog nobody can see, or about to exit. The script's own check therefore
+waits for the client's connection to appear on the server rather than trusting
+`active`, and prints the log if it does not.
+
+To see what it is really doing, stop the service and run the same command in
+the foreground, where it prints its errors to your terminal:
+
+```
+sudo systemctl stop mumble-radio
+grep ExecStart= /etc/systemd/system/mumble-radio.service
+sudo -u radio HOME=/home/radio <the ExecStart line, without "ExecStart=">
+```
+
+What you are likely to see:
+
+| It says | It means |
+| --- | --- |
+| `Could not load the Qt platform plugin "xcb"` | A library Mumble's display code needs is missing. `sudo apt install --reinstall mumble`, which pulls the recommended packages a lean install leaves out. |
+| `Cannot open display` / `Xvfb failed` | `sudo apt install xvfb`, or set `MUMBLE_DISPLAY="offscreen"` in `/etc/ham-radio-pi/setup.conf` and re-run. |
+| Nothing at all, and it does not exit | It is stopped on a wizard. Check `lastupdate=5` is in `~/.config/Mumble/Mumble.conf` and that `~/Documents/MumbleAutomaticCertificateBackup.p12` exists. |
+| `Server connection failed` or a rejected name | The server is not up yet, or the name clashes with your own client's. They must differ. |
+| `ALSA lib ... cannot open` | The capture or playback device in `Mumble.conf` is not what `arecord -l` lists. |
+
+When it works, it prints nothing much and stays running. Stop it with `C-c`
+and `sudo systemctl start mumble-radio`.
 
 To watch what the radio end is doing as it happens:
 
