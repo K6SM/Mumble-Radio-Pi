@@ -509,10 +509,34 @@ What you are likely to see:
 | `Cannot open display` / `Xvfb failed` | `sudo apt install xvfb`, or set `MUMBLE_DISPLAY="offscreen"` in `/etc/ham-radio-pi/setup.conf` and re-run. |
 | Nothing at all, and it does not exit | It is stopped on a wizard. Check `lastupdate=5` is in `~/.config/Mumble/Mumble.conf` and that `~/Documents/MumbleAutomaticCertificateBackup.p12` exists. |
 | `Server connection failed` or a rejected name | The server is not up yet, or the name clashes with your own client's. They must differ. |
+| `Unknown PCM` and `snd_pcm_open(...): No such file or directory` | The device name in `Mumble.conf` must be **quoted** &mdash; see below. |
 | `ALSA lib ... cannot open` | The capture or playback device in `Mumble.conf` is not what `arecord -l` lists. |
 
 When it works, it prints nothing much and stays running. Stop it with `C-c`
 and `sudo systemctl start mumble-radio`.
+
+### The quotes around the ALSA device names
+
+In `~/.config/Mumble/Mumble.conf`:
+
+```
+[alsa]
+input="plughw:CARD=CODEC,DEV=0"
+output="plughw:CARD=CODEC,DEV=0"
+```
+
+**Those quotes are load-bearing, and the same goes for `welcometext` in the
+server's ini.** Mumble reads its configuration with Qt's `QSettings`, which
+treats an unquoted comma as a list separator. Written bare, `plughw:CARD=CODEC,DEV=0`
+comes back as the two-item list `plughw:CARD=CODEC` and `DEV=0`; Qt converts a
+list of more than one item to a string by returning an **empty** string; and
+Mumble then calls `snd_pcm_open("")`, which ALSA answers with `Unknown PCM`.
+
+The failure is quiet in a way worth knowing about. The client starts, connects
+to the server, appears in the user list and never reports a problem &mdash; it
+simply carries silence in both directions, because it has no capture device
+and no playback device. Anything in this file whose value contains a comma
+needs quoting.
 
 To watch what the radio end is doing as it happens:
 

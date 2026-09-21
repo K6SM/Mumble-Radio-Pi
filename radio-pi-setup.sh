@@ -837,7 +837,9 @@ ini_set "$MS_TMP" registerUrl     ""
 ini_set "$MS_TMP" registerHostname ""
 ini_set "$MS_TMP" allowping       "false"
 ini_set "$MS_TMP" serverpassword  "$MUMBLE_SERVER_PASSWORD"
-ini_set "$MS_TMP" welcometext     "<b>${PI_HOSTNAME}</b><br />Radio link. Voice processing off, Opus forced."
+# Quoted for the same QSettings reason as the client's ALSA device names:
+# this text contains a comma.
+ini_set "$MS_TMP" welcometext     "\"<b>${PI_HOSTNAME}</b><br />Radio link. Voice processing off, Opus forced.\""
 install_file "$MS_INI" "$MS_MODE" "$MS_OWNER" < "$MS_TMP"
 rm -f "$MS_TMP"
 
@@ -948,8 +950,14 @@ input=ALSA
 output=ALSA
 
 [alsa]
-input=$AUDIO_CAPTURE
-output=$AUDIO_PLAYBACK
+; THE QUOTES ARE LOAD-BEARING. Mumble reads this file with Qt's QSettings,
+; which treats an unquoted comma as a list separator: written bare, a name
+; like plughw:CARD=CODEC,DEV=0 comes back as a two-item list, Qt converts
+; that to an EMPTY string, and Mumble calls snd_pcm_open("") and reports
+; "Unknown PCM" -- silence in both directions, with the client otherwise
+; running normally. Quoted, it stays one string.
+input="$AUDIO_CAPTURE"
+output="$AUDIO_PLAYBACK"
 
 [net]
 ; 1 frame per packet is 10ms, the main latency control.
@@ -1001,6 +1009,10 @@ Group=$(id -gn "$OP_USER")
 SupplementaryGroups=audio
 WorkingDirectory=$OP_HOME
 Environment=HOME=$OP_HOME
+# A runtime directory of its own, so Qt does not invent one under /tmp.
+RuntimeDirectory=mumble-radio
+RuntimeDirectoryMode=0700
+Environment=XDG_RUNTIME_DIR=/run/mumble-radio
 $MUMBLE_ENV
 # The server is on this machine, so give it a moment to be listening.
 ExecStartPre=/bin/sleep 5
