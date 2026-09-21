@@ -515,28 +515,64 @@ What you are likely to see:
 When it works, it prints nothing much and stays running. Stop it with `C-c`
 and `sudo systemctl start mumble-radio`.
 
-### The quotes around the ALSA device names
+### Never edit Mumble.conf while the client is running
 
-In `~/.config/Mumble/Mumble.conf`:
+Mumble writes its settings back out when it exits. `systemctl restart` stops
+it first, so a restart **saves Mumble's in-memory settings over whatever you
+just typed**, then reads back the file it has itself overwritten. Your edit
+vanishes and nothing says so.
+
+Always:
+
+```
+sudo systemctl stop mumble-radio
+sudoedit /home/radio/.config/Mumble/Mumble.conf
+sudo systemctl start mumble-radio
+```
+
+Stop, edit, start &mdash; never restart. The script does the same thing
+internally, which is why it stops the service before writing the file.
+
+### Commas in the ALSA device names
+
+The device names are written without a device number:
 
 ```
 [alsa]
-input="plughw:CARD=CODEC,DEV=0"
-output="plughw:CARD=CODEC,DEV=0"
+input="plughw:CARD=CODEC"
+output="plughw:CARD=CODEC"
 ```
 
-**Those quotes are load-bearing, and the same goes for `welcometext` in the
-server's ini.** Mumble reads its configuration with Qt's `QSettings`, which
-treats an unquoted comma as a list separator. Written bare, `plughw:CARD=CODEC,DEV=0`
-comes back as the two-item list `plughw:CARD=CODEC` and `DEV=0`; Qt converts a
-list of more than one item to a string by returning an **empty** string; and
-Mumble then calls `snd_pcm_open("")`, which ALSA answers with `Unknown PCM`.
+ALSA defaults `DEV` to 0, so this is the same device as
+`plughw:CARD=CODEC,DEV=0` &mdash; but it contains no comma, and a comma is the
+one character that causes trouble here. Mumble reads its configuration with
+Qt's `QSettings`, which treats an **unquoted comma as a list separator**. A
+bare `plughw:CARD=CODEC,DEV=0` comes back as the two-item list
+`plughw:CARD=CODEC` and `DEV=0`; Qt converts a list of more than one item to a
+string by returning an **empty** string; and Mumble then calls
+`snd_pcm_open("")`, which ALSA answers with `Unknown PCM` and no device name
+after it.
 
-The failure is quiet in a way worth knowing about. The client starts, connects
-to the server, appears in the user list and never reports a problem &mdash; it
-simply carries silence in both directions, because it has no capture device
-and no playback device. Anything in this file whose value contains a comma
-needs quoting.
+A device that genuinely is not device 0 keeps its `,DEV=n` and is quoted, as
+is `welcometext` in the server's ini. Anything in either file whose value
+contains a comma needs quoting.
+
+Two things in the log tell you this has happened:
+
+```
+ALSAAudioInput: Initing audiocapture .
+ALSA lib pcm.c:(snd_pcm_open_noupdate) Unknown PCM
+```
+
+The gap between `audiocapture` and the full stop is where the device name
+should be, and `Unknown PCM` has nothing after it. Both are printing an empty
+string. If the name were merely wrong rather than empty, it would appear in
+both lines &mdash; which is the quickest way to tell a quoting problem from a
+genuinely mistaken card name.
+
+The failure is quiet in a way worth knowing about: the client starts, connects
+to the server, appears in the user list and reports no problem. It simply
+carries silence in both directions, having no capture and no playback device.
 
 To watch what the radio end is doing as it happens:
 

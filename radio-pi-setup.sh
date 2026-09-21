@@ -251,6 +251,16 @@ if [ -f "$CONF_FILE" ]; then
     # shellcheck source=/dev/null
     . "$CONF_FILE"
     ok "Read previous answers from $CONF_FILE"
+    # Runs before this one saved device names as plughw:CARD=Foo,DEV=0. That
+    # comma is what Qt's QSettings turns into a list separator when Mumble
+    # reads the name back, leaving it with no device at all. DEV=0 is ALSA's
+    # default, so dropping it names the same device without the hazard.
+    if [ "${AUDIO_CAPTURE:-}" != "${AUDIO_CAPTURE%,DEV=0}" ] ||
+       [ "${AUDIO_PLAYBACK:-}" != "${AUDIO_PLAYBACK%,DEV=0}" ]; then
+        AUDIO_CAPTURE="${AUDIO_CAPTURE%,DEV=0}"
+        AUDIO_PLAYBACK="${AUDIO_PLAYBACK%,DEV=0}"
+        changed "corrected  saved audio device names, dropping \",DEV=0\""
+    fi
     FIRST_RUN=0
 else
     FIRST_RUN=1
@@ -467,7 +477,17 @@ pick_alsa() { # pick_alsa <arecord|aplay> <prompt> <current> -> device on stdout
     local tool=$1 prompt=$2 current=$3 devs=() names=() line i choice
     while IFS='|' read -r idx id name dev; do
         [ -n "$idx" ] || continue
-        devs+=("plughw:CARD=${id},DEV=${dev}")
+        # Device 0 is left off the name on purpose. ALSA defaults DEV to 0,
+        # so "plughw:CARD=Foo" and "plughw:CARD=Foo,DEV=0" open the same
+        # thing -- but the first has no comma in it, and a comma is the one
+        # character that Qt's QSettings turns into a list separator when
+        # Mumble reads its configuration back. Fewer commas, fewer ways for
+        # the device name to arrive at snd_pcm_open as an empty string.
+        if [ "$dev" = 0 ]; then
+            devs+=("plughw:CARD=${id}")
+        else
+            devs+=("plughw:CARD=${id},DEV=${dev}")
+        fi
         names+=("$name (card $idx, device $dev)")
     done < <("$tool" -l 2>/dev/null |
         sed -n 's/^card \([0-9]*\): \([^ ]*\) \[\([^]]*\)\], device \([0-9]*\):.*/\1|\2|\3|\4/p')
