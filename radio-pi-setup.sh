@@ -1252,14 +1252,28 @@ fi
 # is put there in advance. It is the SHA-1 of the DER form of the
 # certificate, lower case hex, which is what Mumble compares against.
 
-mumble_db_path() {
-    local d
-    for d in "$OP_HOME/.local/share/Mumble" "$OP_HOME/.config/Mumble" "$OP_HOME"; do
-        if [ -f "$d/.mumble.sqlite" ]; then printf '%s' "$d/.mumble.sqlite"; return 0; fi
-        if [ -f "$d/mumble.sqlite" ];  then printf '%s' "$d/mumble.sqlite";  return 0; fi
-    done
-    # Not created yet: this is where Mumble would put it.
-    printf '%s' "$OP_HOME/.local/share/Mumble/mumble.sqlite"
+# Every database Mumble might be using, one per line.
+#
+# Guessing this path is how an earlier version of this script went wrong.
+# Mumble tries its base path, then Qt's DataLocation, then ~/.config/Mumble,
+# then the home directory, and uses the first that already holds a database.
+# Qt's DataLocation is <organization>/<application>, and Mumble sets both to
+# "Mumble", so it is ~/.local/share/Mumble/Mumble -- one level deeper than it
+# looks. Write to the wrong file and every step reports success while Mumble
+# reads a different one.
+#
+# So find what is really there rather than predict it, and write to all of
+# them. A path is only chosen when there is no database at all, and then it
+# is the one Qt would pick.
+mumble_db_paths() {
+    local found
+    found=$(find "$OP_HOME" -maxdepth 5 \( -name 'mumble.sqlite' -o -name '.mumble.sqlite' \) \
+            2>/dev/null || true)
+    if [ -n "$found" ]; then
+        printf '%s\n' "$found"
+    else
+        printf '%s\n' "$OP_HOME/.local/share/Mumble/Mumble/mumble.sqlite"
+    fi
 }
 
 trust_server_cert() {
@@ -1308,8 +1322,21 @@ trust_server_cert() {
         return 0
     fi
 
-    db=$(mumble_db_path)
-    install -d -o "$OP_USER" -g "$group" -m 0755 "$(dirname "$db")"
+    local wrote=0
+    while IFS= read -r db; do
+        [ -n "$db" ] || continue
+        install -d -o "$OP_USER" -g "$group" -m 0755 "$(dirname "$db")"
+        if write_client_db "$db" "$digest"; then wrote=$((wrote + 1)); fi
+    done <<< "$(mumble_db_paths)"
+
+    if [ "$wrote" = 0 ]; then
+        warn "Could not write to any of Mumble's databases."
+    fi
+}
+
+# Put the answers to both of the dialogs nobody can click into one database.
+write_client_db() {
+    local db=$1 digest=$2 pw_sql
 
     # Written as the operator, so the file Mumble owns stays owned by them.
     if sudo -u "$OP_USER" sqlite3 "$db" \
@@ -1317,9 +1344,10 @@ trust_server_cert() {
          CREATE UNIQUE INDEX IF NOT EXISTS \`cert_host_port\` ON \`cert\`(\`hostname\`,\`port\`);
          REPLACE INTO \`cert\` (\`hostname\`,\`port\`,\`digest\`) VALUES ('127.0.0.1',$MUMBLE_PORT,'$digest');" 2>/dev/null
     then
-        ok "trusted    the server's certificate (${digest:0:16}...) in $db"
+        ok "trusted    ${digest:0:16}... in $db"
     else
         warn "Could not write the server certificate digest to $db."
+        return 1
     fi
 
     # A server password is stored in the client's own database rather than
@@ -1327,7 +1355,6 @@ trust_server_cert() {
     # (Database::fuzzyMatch), so the password stays out of the service file
     # and out of every process list on the machine.
     if [ -n "$MUMBLE_SERVER_PASSWORD" ]; then
-        local pw_sql
         pw_sql=${MUMBLE_SERVER_PASSWORD//\'/\'\'}   # SQL doubles a quote
         if sudo -u "$OP_USER" sqlite3 "$db" \
             "CREATE TABLE IF NOT EXISTS \`servers\` (\`id\` INTEGER PRIMARY KEY AUTOINCREMENT, \`name\` TEXT, \`hostname\` TEXT, \`port\` INTEGER DEFAULT 64738, \`username\` TEXT, \`password\` TEXT);
@@ -1340,6 +1367,7 @@ trust_server_cert() {
             warn "stop on a password dialog that nothing here can answer."
         fi
     fi
+    return 0
 }
 
 # --------------------------------------------------------------------------

@@ -540,7 +540,8 @@ DIGEST=$(echo | openssl s_client -connect 127.0.0.1:64738 2>/dev/null \
          | openssl x509 -outform DER | sha1sum | awk '{print $1}')
 
 sudo systemctl stop mumble-radio
-sudo -u radio sqlite3 /home/radio/.local/share/Mumble/mumble.sqlite \
+DB=$(sudo find /home/radio -name 'mumble.sqlite' -o -name '.mumble.sqlite' | head -1)
+sudo -u radio sqlite3 "$DB" \
   "CREATE TABLE IF NOT EXISTS cert (id INTEGER PRIMARY KEY AUTOINCREMENT,
      hostname TEXT, port INTEGER, digest TEXT);
    CREATE UNIQUE INDEX IF NOT EXISTS cert_host_port ON cert(hostname,port);
@@ -549,9 +550,24 @@ sudo systemctl start mumble-radio
 ```
 
 The digest is the SHA-1 of the DER form of the certificate, lower case hex,
-which is what Mumble compares against. If the database is not where that
-command looks, try `~/.config/Mumble/` and `~/`: Mumble uses the first
-`mumble.sqlite` it finds along that path.
+which is what Mumble compares against.
+
+**Find that database, do not predict it.** Mumble tries its base path, then
+Qt's `DataLocation`, then `~/.config/Mumble`, then the home directory, and
+uses the first that already holds one. Qt's `DataLocation` is
+`<organization>/<application>` and Mumble sets both to "Mumble", so the usual
+answer is:
+
+```
+~/.local/share/Mumble/Mumble/mumble.sqlite
+```
+
+&mdash; one level deeper than it looks. Writing to
+`~/.local/share/Mumble/mumble.sqlite` instead creates a second database that
+Mumble never opens, and every step of the work reports success while the
+client goes on refusing the certificate. The script writes to every
+`mumble.sqlite` it can find under the account's home directory for this
+reason.
 
 Give the server a new certificate and the digest changes, at which point the
 radio's client stops connecting until it is stored again. Re-running the script
@@ -648,6 +664,7 @@ That log settles in one line what the client's log cannot:
 | --- | --- |
 | `New connection: 127.0.0.1:...` then `Authenticated` | It connected. If you still hear nothing, the trouble is audio, not the link. |
 | `New connection` then `Rejected` with a reason | The reason is the answer: a wrong password, a duplicate name, a full server. |
+| `New connection: 127.0.0.1:...` then `Connection closed: The remote host closed the connection`, with no `Client version` between them | The client hung up during the handshake: it does not trust the certificate. The digest is missing, wrong, or in a database Mumble is not reading. |
 | Nothing from 127.0.0.1 at all | The client never opened a connection &mdash; it is stopped before that, or aimed somewhere else. |
 
 That last case is the one worth knowing: if the server never saw an attempt,
