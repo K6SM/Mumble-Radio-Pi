@@ -1321,6 +1321,25 @@ trust_server_cert() {
     else
         warn "Could not write the server certificate digest to $db."
     fi
+
+    # A server password is stored in the client's own database rather than
+    # put in the mumble:// URL. Mumble fills an empty password in from there
+    # (Database::fuzzyMatch), so the password stays out of the service file
+    # and out of every process list on the machine.
+    if [ -n "$MUMBLE_SERVER_PASSWORD" ]; then
+        local pw_sql
+        pw_sql=${MUMBLE_SERVER_PASSWORD//\'/\'\'}   # SQL doubles a quote
+        if sudo -u "$OP_USER" sqlite3 "$db" \
+            "CREATE TABLE IF NOT EXISTS \`servers\` (\`id\` INTEGER PRIMARY KEY AUTOINCREMENT, \`name\` TEXT, \`hostname\` TEXT, \`port\` INTEGER DEFAULT 64738, \`username\` TEXT, \`password\` TEXT);
+             DELETE FROM \`servers\` WHERE \`hostname\`='127.0.0.1' AND \`port\`=$MUMBLE_PORT AND \`username\`='$MUMBLE_RADIO_USER';
+             INSERT INTO \`servers\` (\`name\`,\`hostname\`,\`port\`,\`username\`,\`password\`) VALUES ('${PI_HOSTNAME}','127.0.0.1',$MUMBLE_PORT,'$MUMBLE_RADIO_USER','$pw_sql');" 2>/dev/null
+        then
+            ok "stored     the server password for the radio's client"
+        else
+            warn "Could not store the server password in $db. The client will"
+            warn "stop on a password dialog that nothing here can answer."
+        fi
+    fi
 }
 
 # --------------------------------------------------------------------------

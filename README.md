@@ -509,7 +509,7 @@ What you are likely to see:
 | `Cannot open display` / `Xvfb failed` | `sudo apt install xvfb`, or set `MUMBLE_DISPLAY="offscreen"` in `/etc/ham-radio-pi/setup.conf` and re-run. |
 | Nothing at all, and it does not exit | It is stopped on a wizard. Check `lastupdate=5` is in `~/.config/Mumble/Mumble.conf` and that `~/Documents/MumbleAutomaticCertificateBackup.p12` exists. |
 | `Server connection failed` or a rejected name | The server is not up yet, or the name clashes with your own client's. They must differ. |
-| Nothing at all after `ServerHandler: TLS cipher preference` | It is stopped on the certificate dialog &mdash; see below. |
+| Nothing at all after `ServerHandler: TLS cipher preference` | It is stopped on a dialog nobody can see &mdash; the certificate one, or the password one. Both are below. The server's own log says which. |
 | `Unknown PCM` and `snd_pcm_open(...): No such file or directory` | The device name in `Mumble.conf` must be **quoted** &mdash; see below. |
 | `ALSA lib ... cannot open` | The capture or playback device in `Mumble.conf` is not what `arecord -l` lists. |
 
@@ -556,6 +556,22 @@ command looks, try `~/.config/Mumble/` and `~/`: Mumble uses the first
 Give the server a new certificate and the digest changes, at which point the
 radio's client stops connecting until it is stored again. Re-running the script
 does that for you.
+
+### A server password, and the other invisible dialog
+
+If you set a server password, the radio's client needs it too &mdash; and a
+client that is refused for want of one raises a `QInputDialog` asking for it,
+which on this machine nobody can answer. The symptom is identical to the
+certificate one: a client that runs and never connects.
+
+The script does **not** put the password in the `mumble://` URL, where every
+process list on the machine would show it. It stores it in the client's own
+database instead, in the `servers` table, which is where Mumble looks when the
+URL carries no password (`Database::fuzzyMatch`).
+
+So the two invisible dialogs have the same shape and the same cure: give the
+client, in advance and in its database, the answer it would otherwise stop to
+ask for.
 
 ### Never edit Mumble.conf while the client is running
 
@@ -615,6 +631,27 @@ genuinely mistaken card name.
 The failure is quiet in a way worth knowing about: the client starts, connects
 to the server, appears in the user list and reports no problem. It simply
 carries silence in both directions, having no capture and no playback device.
+
+### Ask the server, not the client
+
+The client cannot tell you why it was refused &mdash; its own messages go to a
+chat window that does not exist here. The server can, and it writes plainly to
+a file:
+
+```
+sudo tail -40 /var/log/mumble-server/mumble-server.log
+```
+
+That log settles in one line what the client's log cannot:
+
+| The server says | Meaning |
+| --- | --- |
+| `New connection: 127.0.0.1:...` then `Authenticated` | It connected. If you still hear nothing, the trouble is audio, not the link. |
+| `New connection` then `Rejected` with a reason | The reason is the answer: a wrong password, a duplicate name, a full server. |
+| Nothing from 127.0.0.1 at all | The client never opened a connection &mdash; it is stopped before that, or aimed somewhere else. |
+
+That last case is the one worth knowing: if the server never saw an attempt,
+no amount of changing server settings will help.
 
 To watch what the radio end is doing as it happens:
 
