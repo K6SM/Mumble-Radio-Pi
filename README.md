@@ -567,7 +567,14 @@ answer is:
 Mumble never opens, and every step of the work reports success while the
 client goes on refusing the certificate. The script writes to every
 `mumble.sqlite` it can find under the account's home directory for this
-reason.
+reason, and then asks the running client, through `/proc/<pid>/fd`, which
+file it actually opened and whether that file holds the digest. Writing it
+somewhere is not the same as writing it where the client reads it, and only
+the second is worth reporting as success.
+
+If an older run left a stray database the client does not read, it is inert
+and can be deleted &mdash; `sudo find /home/radio -name 'mumble.sqlite'` lists
+them, and the one the client has open is the one to keep.
 
 Give the server a new certificate and the digest changes, at which point the
 radio's client stops connecting until it is stored again. Re-running the script

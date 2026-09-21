@@ -1423,6 +1423,35 @@ check_service "$MS_SERVICE"
 check_service rigctld.service
 check_service mumble-radio.service
 
+# Writing the digest somewhere is not the same as writing it where the
+# client reads it. Ask the running process which file it actually opened.
+verify_client_db() {
+    local pid db fd target row
+    pid=$(pgrep -x mumble 2>/dev/null | head -1) || true
+    if [ -z "${pid:-}" ]; then return 0; fi
+    for fd in /proc/"$pid"/fd/*; do
+        target=$(readlink -f "$fd" 2>/dev/null) || continue
+        case "$target" in
+            *mumble.sqlite) db=$target; break ;;
+        esac
+    done
+    if [ -z "${db:-}" ]; then return 0; fi
+    row=$(sudo -u "$OP_USER" sqlite3 "$db" \
+          "SELECT digest FROM cert WHERE hostname='127.0.0.1' AND port=$MUMBLE_PORT;" \
+          2>/dev/null) || true
+    if [ -n "$row" ]; then
+        ok "verified   the client reads $db, and it holds the digest"
+    else
+        warn "The client has this database open:"
+        warn "  $db"
+        warn "and it does NOT hold the server's certificate digest, which is"
+        warn "why it will not connect. Any other mumble.sqlite on this machine"
+        warn "is a stray and can be deleted."
+        FAILED=1
+    fi
+}
+verify_client_db
+
 RESTARTS=$(systemctl show -p NRestarts --value mumble-radio.service 2>/dev/null || echo 0)
 if [ "${RESTARTS:-0}" -gt 1 ]; then
     warn "the Mumble client has restarted ${RESTARTS} times already, so it is"
