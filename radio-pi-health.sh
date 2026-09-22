@@ -141,8 +141,26 @@ report() {
 
     echo
     echo "== Any undervoltage ever seen =="
-    grep -v 'throttled=0x0' "$LOG" | grep -v 'throttled=n/a' | tail -20 \
-        || echo "  none recorded"
+    if grep 'throttled=' "$LOG" | grep -v 'throttled=0x0' | grep -v 'throttled=n/a' \
+       | tail -20 | grep . ; then :; else echo "  none: the supply has been clean"; fi
+
+    echo
+    echo "== Wi-Fi, every time it changed state =="
+    awk '
+        {
+            w = ""
+            for (i = 1; i <= NF; i++) if ($i ~ /^wifi=/) { w = $i; sub(/^wifi=/, "", w); sub(/\/.*/, "", w) }
+            if (w != "" && w != last) {
+                if (NR > 1) printf "  %s   %s -> %s\n", $1, (last == "" ? "?" : last), w
+                last = w
+            }
+            if (w == "down") down++
+            if (w != "" && w != "down") up++
+        }
+        END {
+            printf "  %d minutes with the link up, %d with it down\n", up, down
+        }
+    ' "$LOG"
 
     echo
     echo "== Lowest free memory recorded =="
