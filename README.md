@@ -44,6 +44,8 @@ uses.
 - [Checking it works](#checking-it-works)
 - [Setting the audio levels](#setting-the-audio-levels)
 - [Using the Pi at the radio](#using-the-pi-at-the-radio)
+- [Hamlib, built from source](#hamlib-built-from-source)
+- [Keeping the Wi-Fi up](#keeping-the-wi-fi-up)
 - [Latency and power](#latency-and-power)
 - [Running the script again](#running-the-script-again)
 - [Security](#security)
@@ -103,9 +105,12 @@ adapter.
 
 ## Running the script
 
-It takes fifteen to forty minutes, most of it `apt` fetching Mumble. It
-installs Hamlib first, then asks its questions, then installs the rest, so the
-questions come early and the long wait is unattended.
+The first run is long: Hamlib is compiled from source, which on a Pi Zero 2W
+takes twenty to forty-five minutes, and then `apt` fetches Mumble. Hamlib has
+to come first, because the list of radios the script offers is that Hamlib's
+own list, so the questions come after the build. Once you have answered them
+the rest runs unattended. A re-run skips the build unless the Hamlib version
+has changed.
 
 Answers are saved in `/etc/ham-radio-pi/setup.conf`. Every file it replaces is
 copied to `/etc/ham-radio-pi/backups/` first.
@@ -114,7 +119,8 @@ copied to `/etc/ham-radio-pi/backups/` first.
 | --- | --- |
 | `--unattended` | Ask nothing; use the saved answers. For re-running after a software upgrade. |
 | `--reset-password` | Put the login password back to the documented default. |
-| `--skip-apt` | Change no packages; only rewrite the configuration and restart the services. |
+| `--skip-apt` | Change no packages and build nothing; only rewrite the configuration and restart the services. |
+| `--rebuild-hamlib` | Build Hamlib again even though the wanted version is installed. |
 
 ## What it asks
 
@@ -157,6 +163,10 @@ survives the cards being numbered differently after a reboot.
 **Mumble.** Port, how many clients to admit, the bandwidth ceiling, and the
 name the radio end joins under. Leave the server password blank on a home LAN
 or behind a VPN.
+
+**Keeping the Wi-Fi up.** Whether to run the Wi-Fi watchdog, and whether it
+may reboot as a last resort. Both default to yes; see
+[Keeping the Wi-Fi up](#keeping-the-wi-fi-up).
 
 **Power and latency.** Covered in [Latency and power](#latency-and-power).
 The defaults are: Wi-Fi power saving off, `ondemand` governor, screen blanking
@@ -357,6 +367,106 @@ daemon owns the serial port and everything else shares it.
 The screen blanks after five minutes and comes back on a keypress. That is
 power saving, not a screensaver; nothing is logged out.
 
+## Hamlib, built from source
+
+The script builds Hamlib from the upstream release rather than installing
+Debian's, which lags by years: Bookworm ships 4.5.4, and fixes in `rigctld`
+and in individual radio backends since then are exactly what `ham-rig` runs
+into. It builds **4.7.2**, from the release tarball, checked against a pinned
+SHA-256 &mdash; the same one GitHub and SourceForge both publish.
+
+It goes into `/usr/local`, and `rigctld` is linked with a run path to its own
+library. That matters: Debian's `libhamlib.so.4` and ours have the same name,
+and without the run path the dynamic linker's search order, not you, would
+decide which one `rigctld` loaded. The script checks, after building, that it
+loads its own.
+
+Once the build works, Debian's `libhamlib-utils` is removed so there is one
+`rigctld` on the machine, not two. Debian's library stays only if something
+else needs it &mdash; fldigi or WSJT-X, say &mdash; which is harmless, since our
+`rigctld` does not use it.
+
+```
+rigctld --version          # Hamlib 4.7.2
+ldd /usr/local/bin/rigctld | grep hamlib    # /usr/local/lib/libhamlib.so.4
+```
+
+**Model numbers do not change** between Hamlib versions: the FTDX-10 is 1042
+in 4.5.4 and in 4.7.2, so a station set up on the old version keeps its saved
+answers.
+
+**Another version.** Put both lines in `/etc/ham-radio-pi/setup.conf` and
+re-run:
+
+```
+HAMLIB_VERSION="4.7.3"
+HAMLIB_SHA256="<the sha256 of hamlib-4.7.3.tar.gz>"
+```
+
+Without a checksum it still builds, and prints the sum of what it downloaded
+so you can pin it. `sudo apt upgrade` never touches this Hamlib; a new version
+is always a deliberate re-run.
+
+If a build fails, the script stops and names the log
+(`/usr/local/src/hamlib/build-<version>.log`); nothing is removed, so a
+`rigctld` that worked before still does.
+
+## Keeping the Wi-Fi up
+
+A station you cannot walk over to has to put its own network back. The Wi-Fi
+watchdog, `ham-radio-pi-wifiwatch`, checks every twenty seconds that the Pi is
+really on the network: that the interface exists, is joined to a network, has
+an address, and that the router answers. After a minute of failures it treats
+it as an outage and does two things, **in this order**:
+
+1. **It writes down the evidence, before touching anything.** Recovering
+   destroys most of it &mdash; reloading the driver clears the kernel's own
+   account &mdash; so the kernel log, NetworkManager's log, the link and
+   address state, the power supply flags, and a scan of which networks are
+   still visible all go to one file per outage in
+   `/var/log/ham-radio-pi/wifi-incidents/`.
+
+2. **It recovers, in escalating steps, stopping at the first that works:**
+
+   | Step | What it does |
+   | --- | --- |
+   | reassociate | Asks NetworkManager to rejoin |
+   | restart-interface | Turns the Wi-Fi radio off and on |
+   | reload-driver | Unloads and reloads the Wi-Fi driver, restarting its firmware |
+   | reboot | Last resort: at most three times a day, never in the first half hour after a boot |
+
+**Which step worked is the diagnosis.** After a few outages:
+
+```
+sudo ham-radio-pi-wifiwatch --report
+```
+
+counts them by what failed and by what fixed it:
+
+| It says | Meaning |
+| --- | --- |
+| `not-associated`, fixed by `reassociate` | NetworkManager had stopped trying, or the router dropped the Pi and it did not rejoin by itself |
+| `not-associated`, fixed by `reload-driver` | The Wi-Fi firmware had stopped |
+| `no-interface` | The driver or its firmware crashed and took the interface with it |
+| `no-address` | It joined the network but DHCP gave it no address: look at the router |
+| `gateway-silent` | Joined, with an address, but traffic stopped: firmware or interference |
+
+Each evidence file opens with the kernel's messages at the moment it failed.
+`brcmfmac` is the Pi's Wi-Fi driver; lines from it just before the failure are
+the ones to read.
+
+**NetworkManager is also told never to give up.** By default it tries a
+failing Wi-Fi connection four times and then stops for good, until something
+outside it intervenes &mdash; on an unattended machine, the difference between
+a thirty-second drop and a station that is gone until someone visits. The
+script sets `autoconnect-retries` to zero, meaning for ever, on every Wi-Fi
+connection. If your outages were that, they stop; any that remain are
+something else, and the watchdog's report will say what.
+
+To turn the watchdog off, answer no when the script asks, or set
+`WIFI_WATCHDOG="no"` in `/etc/ham-radio-pi/setup.conf` and re-run.
+`WIFI_WATCHDOG_REBOOT="no"` keeps it but forbids the reboot.
+
 ## Latency and power
 
 The brief for these settings is: as little latency as the hardware allows,
@@ -389,7 +499,7 @@ settings are listed in [What the script changes](#what-the-script-changes).
 | Screen blanking | 300 s | An attached monitor powers down and comes back on a keypress. |
 | Bluetooth off | | Say no to this if your keyboard is Bluetooth. |
 | Activity LEDs off | | A few milliamps, and the Pi is in a shack, not on a desk. |
-| Journal in RAM | | The journal is the steadiest writer on an idle station, and each flush spins the card up. `journalctl` still shows the current boot; it starts empty after a reboot. |
+| Journal, capped and batched | 64 MB, synced every 5 min | The journal is kept on disk so that a fault which stops the machine leaves its account behind (`journalctl -b -1`), but capped, and written in batches rather than line by line. `JOURNAL_STORAGE="volatile"` in `setup.conf` puts it back in RAM, sparing the card at the cost of losing it at every reboot. |
 | Later, fewer disk writes | `dirty_writeback_centisecs` | Same reason. |
 | Automatic updates off | | `apt` timers fire at unpredictable times, which is both current and a CPU spike in the middle of a contact. Update by hand; see below. |
 | Onboard audio off | | Unless you chose it as the radio's sound device. |
@@ -427,6 +537,8 @@ Two things a re-run does **not** do:
 
 - It does not reset your login password. Use `--reset-password` for that.
 - It does not regenerate the Mumble certificate or the SuperUser password.
+- It does not rebuild Hamlib, unless the version wanted has changed or you
+  pass `--rebuild-hamlib`.
 
 One thing it **does** overwrite: the radio-end Mumble client's configuration,
 `~/.config/Mumble/Mumble.conf`. Those settings are the station's, not yours;
@@ -704,9 +816,25 @@ with the first version kept as `.original`.
 /etc/systemd/journald.conf.d/99-ham-radio-pi.conf
 /etc/NetworkManager/conf.d/99-ham-radio-pi.conf
 /etc/systemd/system/getty@tty1.service.d/autologin.conf
+/etc/ham-radio-pi/wifiwatch.conf              the watchdog's settings
+/usr/local/sbin/ham-radio-pi-wifiwatch
+/etc/systemd/system/ham-radio-pi-wifiwatch.service
 ~/.config/Mumble/Mumble.conf                  the radio-end client
 ~/Documents/MumbleAutomaticCertificateBackup.p12
 ```
+
+**Installed from source**: Hamlib, under `/usr/local` (`bin/rigctld`,
+`bin/rigctl`, `lib/libhamlib.so.4` and the rest), with the release tarball
+kept in `/usr/local/src/hamlib/`.
+
+**Written as it runs**: `/var/log/ham-radio-pi/wifi-watch.log` and one file
+per outage in `/var/log/ham-radio-pi/wifi-incidents/`, the newest hundred kept.
+
+**Settings it changes**: `autoconnect-retries` set to 0 on every Wi-Fi
+connection NetworkManager knows about.
+
+**Packages it removes**: Debian's `libhamlib-utils`, and `libhamlib4` if
+nothing else uses it.
 
 **Files it edits**, leaving the rest alone:
 
@@ -723,7 +851,8 @@ so, and the `apt-daily`, `man-db` and `fstrim` timers.
 
 **Services it makes sure are on**: `ssh`, `avahi-daemon` — which is what
 answers to `radio.local`, and why it is not in the list above —
-`mumble-server`, `rigctld`, `mumble-radio`.
+`mumble-server`, `rigctld`, `mumble-radio`, and `ham-radio-pi-wifiwatch`
+if you asked for it.
 
 To undo a piece of it: delete the marked block from `config.txt`, remove the
 `99-ham-radio-pi` files, `systemctl disable --now` the three services, and

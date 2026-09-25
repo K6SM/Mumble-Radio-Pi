@@ -48,6 +48,16 @@ DEFAULT_PASSWORD="ChangeMe73"
 UNATTENDED=0
 RESET_PASSWORD=0
 SKIP_APT=0
+REBUILD_HAMLIB=0
+
+# Hamlib is built from the upstream release, not taken from Debian, whose
+# Hamlib lags by years (Bookworm ships 4.5.4). The checksum is of the release
+# tarball as published on both GitHub and SourceForge, which agree.
+HAMLIB_PINNED_VERSION="4.7.2"
+HAMLIB_PINNED_SHA256="ae1fcf2dbc80ea0786ea8f047b09399c3f7737d1930442f61a031708ed33e88f"
+HAMLIB_PREFIX=/usr/local
+RIGCTLD_BIN=$HAMLIB_PREFIX/bin/rigctld
+RIGCTL_BIN=$HAMLIB_PREFIX/bin/rigctl
 
 CHANGES=()
 
@@ -197,8 +207,11 @@ radio-pi-setup.sh $VERSION -- radio-end Raspberry Pi for remote operating
   --reset-password    Set the login account's password back to the
                       documented default. Off by default so that a re-run
                       never undoes a password you changed.
-  --skip-apt          Do not install or update packages; only rewrite the
-                      configuration and restart the services.
+  --skip-apt          Do not install or update packages, and do not build
+                      Hamlib; only rewrite the configuration and restart the
+                      services.
+  --rebuild-hamlib    Build Hamlib again even if the wanted version is
+                      already installed.
   -h, --help          This text.
 USAGE
 }
@@ -208,6 +221,7 @@ while [ $# -gt 0 ]; do
         --unattended)     UNATTENDED=1 ;;
         --reset-password) RESET_PASSWORD=1 ;;
         --skip-apt)       SKIP_APT=1 ;;
+        --rebuild-hamlib) REBUILD_HAMLIB=1 ;;
         -h|--help)        usage; exit 0 ;;
         *)                usage; die "Unknown option: $1" ;;
     esac
@@ -297,14 +311,163 @@ apt_install_gui() {
     DEBIAN_FRONTEND=noninteractive apt-get install -y "$@"
 }
 
+# --------------------------------------------------------------------------
+# Hamlib, built from source
+# --------------------------------------------------------------------------
+#
+# Installed under /usr/local and linked with a run path to its own library,
+# so that it cannot pick up Debian's older libhamlib.so.4 by accident: both
+# have the same soname, and the dynamic linker's search order would otherwise
+# decide which one rigctld got.
+#
+# A re-run with the same version does nothing. A new version is a new
+# HAMLIB_VERSION in setup.conf (with its HAMLIB_SHA256), or a newer copy of
+# this script.
+
+HAMLIB_VERSION_WANTED=${HAMLIB_VERSION:-$HAMLIB_PINNED_VERSION}
+
+# Prints the installed version, or nothing. It must never fail: it is called
+# in assignments, where under set -e and pipefail a missing rigctld -- the
+# normal state on a first run -- would end the script with no message.
+hamlib_installed_version() {
+    if [ -x "$RIGCTLD_BIN" ]; then
+        "$RIGCTLD_BIN" --version 2>/dev/null | awk '{print $3; exit}' || true
+    fi
+}
+
+build_hamlib() {
+    local v=$HAMLIB_VERSION_WANTED want got src tarball log jobs mem_mb
+    local have_v
+    have_v=$(hamlib_installed_version)
+
+    if [ "$have_v" = "$v" ] && [ "$REBUILD_HAMLIB" = 0 ]; then
+        ok "Hamlib $v, already built in $HAMLIB_PREFIX"
+        return 0
+    fi
+    if [ "$SKIP_APT" = 1 ]; then
+        warn "--skip-apt: not building Hamlib $v (installed: ${have_v:-none})"
+        return 0
+    fi
+
+    apt_install build-essential pkg-config libreadline-dev libusb-1.0-0-dev \
+                curl ca-certificates
+
+    if [ "$v" = "$HAMLIB_PINNED_VERSION" ]; then
+        want=$HAMLIB_PINNED_SHA256
+    else
+        want=${HAMLIB_SHA256:-}
+    fi
+
+    src=/usr/local/src/hamlib
+    mkdir -p "$src"
+    tarball=$src/hamlib-$v.tar.gz
+
+    # A tarball kept from an earlier run is reused only if it still checks out.
+    if [ -s "$tarball" ] && [ -n "$want" ] &&
+       [ "$(sha256sum "$tarball" | awk '{print $1}')" != "$want" ]; then
+        rm -f "$tarball"
+    fi
+    if [ ! -s "$tarball" ]; then
+        say "downloading Hamlib $v"
+        if ! curl -fsSL --retry 3 -o "$tarball.part" \
+                "https://github.com/Hamlib/Hamlib/releases/download/$v/hamlib-$v.tar.gz" &&
+           ! curl -fsSL --retry 3 -o "$tarball.part" \
+                "https://sourceforge.net/projects/hamlib/files/hamlib/$v/hamlib-$v.tar.gz/download"; then
+            rm -f "$tarball.part"
+            die "Could not download Hamlib $v from GitHub or SourceForge."
+        fi
+        mv "$tarball.part" "$tarball"
+    fi
+
+    got=$(sha256sum "$tarball" | awk '{print $1}')
+    if [ -n "$want" ]; then
+        if [ "$got" != "$want" ]; then
+            rm -f "$tarball"
+            die "Hamlib $v failed its checksum: got $got, expected $want."
+        fi
+        ok "Hamlib $v tarball, checksum verified"
+    else
+        warn "No checksum is known for Hamlib $v, so what was downloaded is"
+        warn "being trusted as is (sha256 $got). To pin it, add to $CONF_FILE:"
+        warn "  HAMLIB_SHA256=\"$got\""
+    fi
+
+    rm -rf "$src/hamlib-$v"
+    tar -xzf "$tarball" -C "$src"
+
+    # Parallel compiles by memory, not by cores: a Zero 2W has four cores
+    # and 512MB, and four compilers at once can run it out.
+    mem_mb=$(awk '/MemAvailable/ {printf "%d", $2/1024}' /proc/meminfo)
+    jobs=$(( mem_mb / 200 ))
+    if [ "$jobs" -lt 1 ]; then jobs=1; fi
+    if [ "$jobs" -gt "$(nproc)" ]; then jobs=$(nproc); fi
+
+    log=$src/build-$v.log
+    say "building Hamlib $v with $jobs parallel job(s)."
+    say "On a Pi Zero 2W this takes 20 to 45 minutes; on a Pi 4 or 5, a few."
+    say "Progress goes to $log"
+
+    if ! (
+        cd "$src/hamlib-$v" &&
+        ./configure --prefix="$HAMLIB_PREFIX" --disable-static \
+                    --without-cxx-binding --disable-html-matrix \
+                    LDFLAGS="-Wl,-rpath,$HAMLIB_PREFIX/lib" &&
+        make -j"$jobs" &&
+        make install
+    ) > "$log" 2>&1; then
+        tail -25 "$log" >&2
+        die "Hamlib $v did not build; the full log is $log.
+       Nothing was removed: any rigctld that worked before still does."
+    fi
+    ldconfig
+
+    have_v=$(hamlib_installed_version)
+    if [ "$have_v" != "$v" ]; then
+        die "Built Hamlib $v, but $RIGCTLD_BIN reports \"${have_v:-nothing}\"."
+    fi
+    if ! ldd "$RIGCTLD_BIN" 2>/dev/null | grep -q "$HAMLIB_PREFIX/lib/libhamlib"; then
+        die "$RIGCTLD_BIN is not loading its own library from $HAMLIB_PREFIX/lib."
+    fi
+
+    rm -rf "${src:?}/hamlib-$v"      # the build tree; the tarball is kept
+    changed "built      Hamlib $v in $HAMLIB_PREFIX"
+}
+
+# Debian's copy goes once ours works, so that there is exactly one rigctld on
+# the machine. Its library stays if something else needs it -- fldigi or
+# WSJT-X, say -- which is harmless: our rigctld uses its own.
+remove_distro_hamlib() {
+    local pkg others
+    if dpkg-query -W -f='${Status}' libhamlib-utils 2>/dev/null | grep -q 'ok installed'; then
+        DEBIAN_FRONTEND=noninteractive apt-get purge -y libhamlib-utils >/dev/null 2>&1 &&
+            changed "removed    Debian's libhamlib-utils, so only one rigctld exists"
+    fi
+    for pkg in libhamlib4 libhamlib4t64; do
+        if dpkg-query -W -f='${Status}' "$pkg" 2>/dev/null | grep -q 'ok installed'; then
+            others=$(apt-cache rdepends --installed "$pkg" 2>/dev/null | tail -n +3 |
+                     sed 's/^[ |]*//' | grep -v -x -e libhamlib-utils -e "$pkg" | sort -u |
+                     tr '\n' ' ')
+            if [ -z "${others// /}" ]; then
+                DEBIAN_FRONTEND=noninteractive apt-get purge -y "$pkg" >/dev/null 2>&1 &&
+                    changed "removed    Debian's $pkg, which nothing else used"
+            else
+                note "kept       Debian's $pkg: needed by $others"
+            fi
+        fi
+    done
+}
+
 if [ "$SKIP_APT" = 0 ]; then
-    head_ "Installing Hamlib"
+    head_ "Installing Hamlib $HAMLIB_VERSION_WANTED"
     DEBIAN_FRONTEND=noninteractive apt-get update
-    apt_install libhamlib-utils alsa-utils openssl ca-certificates
-    ok "Hamlib $(rigctld --version 2>/dev/null | head -1 | awk '{print $NF}')"
+    apt_install alsa-utils openssl ca-certificates
+fi
+build_hamlib
+if [ "$(hamlib_installed_version)" = "$HAMLIB_VERSION_WANTED" ]; then
+    remove_distro_hamlib
 fi
 
-have rigctl || die "rigctl is not installed; cannot offer the list of radios."
+[ -x "$RIGCTL_BIN" ] || die "$RIGCTL_BIN is missing; cannot offer the list of radios."
 
 # --------------------------------------------------------------------------
 # The interview
@@ -330,9 +493,9 @@ OP_USER=$(ask "Login account for the operator" "${OP_USER:-radio}")
 head_ "The radio"
 
 RIGLIST=$(mktemp); trap 'rm -f "$RIGLIST"' EXIT
-rigctl -l > "$RIGLIST" 2>/dev/null || die "rigctl -l failed."
+"$RIGCTL_BIN" -l > "$RIGLIST" 2>/dev/null || die "rigctl -l failed."
 RIGCOUNT=$(grep -cE '^[[:space:]]*[0-9]+' "$RIGLIST" || true)
-say "This Hamlib supports $RIGCOUNT radios."
+say "Hamlib $(hamlib_installed_version) supports $RIGCOUNT radios."
 
 # One line of "rigctl -l" is: number, maker, model, version, status, macro.
 # The maker and the model can both hold spaces; the last three fields cannot.
@@ -563,6 +726,28 @@ fi
 WIFI_POWERSAVE=$(ask "Wi-Fi power saving [off/on]" "${WIFI_POWERSAVE:-off}")
 case "${WIFI_POWERSAVE,,}" in on|yes) WIFI_POWERSAVE=on ;; *) WIFI_POWERSAVE=off ;; esac
 
+if [ "$UNATTENDED" = 0 ]; then
+    cat <<'WATCHNOTE'
+
+   A station you cannot walk over to has to put its own Wi-Fi back when it
+   drops. The watchdog checks every 20 seconds; after a minute's outage it
+   writes down the evidence, then tries rejoining, restarting the Wi-Fi, and
+   reloading the driver, in that order. Rebooting is the last resort, at most
+   three times a day and never in the first half hour after a boot.
+
+WATCHNOTE
+fi
+if ask_yn "Watch the Wi-Fi and reconnect it when it drops?" "${WIFI_WATCHDOG_DEFAULT:-yes}"; then
+    WIFI_WATCHDOG=yes
+else
+    WIFI_WATCHDOG=no
+fi
+WIFI_WATCHDOG_REBOOT=no
+if [ "$WIFI_WATCHDOG" = yes ] &&
+   ask_yn "As a last resort, reboot if nothing else brings it back?" "${WIFI_WATCHDOG_REBOOT_DEFAULT:-yes}"; then
+    WIFI_WATCHDOG_REBOOT=yes
+fi
+
 CPU_GOVERNOR=$(ask "CPU governor [ondemand/powersave/performance]" "${CPU_GOVERNOR:-ondemand}")
 CONSOLE_BLANK=$(ask "Blank an attached screen after how many seconds, 0 for never" "${CONSOLE_BLANK:-300}")
 
@@ -614,7 +799,20 @@ MUMBLE_SERVER_PASSWORD="$MUMBLE_SERVER_PASSWORD"
 MUMBLE_DISPLAY="$MUMBLE_DISPLAY"
 
 WIFI_POWERSAVE="$WIFI_POWERSAVE"
+WIFI_WATCHDOG="$WIFI_WATCHDOG"
+WIFI_WATCHDOG_REBOOT="$WIFI_WATCHDOG_REBOOT"
 CPU_GOVERNOR="$CPU_GOVERNOR"
+
+# persistent keeps the journal across reboots, which is what finds a fault
+# that stops the machine; volatile keeps it in RAM and saves the SD card.
+JOURNAL_STORAGE="${JOURNAL_STORAGE:-persistent}"
+
+# Hamlib is built from source. Empty means the version this script pins
+# (${HAMLIB_PINNED_VERSION}). To choose another, give both lines:
+#   HAMLIB_VERSION="4.7.3"
+#   HAMLIB_SHA256="<sha256 of hamlib-4.7.3.tar.gz>"
+HAMLIB_VERSION="${HAMLIB_VERSION:-}"
+HAMLIB_SHA256="${HAMLIB_SHA256:-}"
 CONSOLE_BLANK="$CONSOLE_BLANK"
 DISABLE_BT="$DISABLE_BT"
 LED_OFF="$LED_OFF"
@@ -628,6 +826,8 @@ LED_OFF_DEFAULT="$LED_OFF"
 AUTOLOGIN_DEFAULT="$AUTOLOGIN"
 INSTALL_EMACS_DEFAULT="$INSTALL_EMACS"
 INSTALL_K6SM_DEFAULT="$INSTALL_K6SM"
+WIFI_WATCHDOG_DEFAULT="$WIFI_WATCHDOG"
+WIFI_WATCHDOG_REBOOT_DEFAULT="$WIFI_WATCHDOG_REBOOT"
 CONF
 
 # --------------------------------------------------------------------------
@@ -784,7 +984,6 @@ if [ -n "$RIG_SPEED" ];    then RIGCTLD_ARGS+=(-s "$RIG_SPEED");    fi
 if [ -n "$RIG_CIVADDR" ];  then RIGCTLD_ARGS+=(-c "$RIG_CIVADDR");  fi
 if [ -n "$RIG_PTT_TYPE" ]; then RIGCTLD_ARGS+=(-P "$RIG_PTT_TYPE"); fi
 
-RIGCTLD_BIN=$(command -v rigctld)
 
 install_file /etc/systemd/system/rigctld.service <<RIGUNIT
 [Unit]
@@ -1161,14 +1360,28 @@ vm.swappiness = 10
 SYSCTL
 sysctl -q --system >/dev/null 2>&1 || true
 
-install_file /etc/systemd/journald.conf.d/99-ham-radio-pi.conf <<'JOURNALD'
-# ham-radio-pi: keep the journal in RAM. It is the steadiest writer on an
-# otherwise idle station, and an appliance that reboots cleanly has little
-# use for yesterday's log. journalctl still shows this boot.
+JOURNAL_STORAGE="${JOURNAL_STORAGE:-persistent}"
+if [ "$JOURNAL_STORAGE" = volatile ]; then
+    install_file /etc/systemd/journald.conf.d/99-ham-radio-pi.conf <<'JOURNALD'
+# ham-radio-pi: the journal is kept in RAM, sparing the SD card. It is lost
+# at every reboot, including the one that follows a fault.
 [Journal]
 Storage=volatile
 RuntimeMaxUse=32M
 JOURNALD
+else
+    install_file /etc/systemd/journald.conf.d/99-ham-radio-pi.conf <<'JOURNALD'
+# ham-radio-pi: the journal is kept on disk, capped, so that a fault which
+# stops or restarts the machine leaves its account behind: journalctl -b -1
+# shows the boot before this one. A station you cannot walk over to needs
+# that more than the SD card needs sparing. Writes are batched every five
+# minutes, and anything at warning level or above is written at once.
+[Journal]
+Storage=persistent
+SystemMaxUse=64M
+SyncIntervalSec=5m
+JOURNALD
+fi
 systemctl restart systemd-journald >/dev/null 2>&1 || true
 
 # --- services that do nothing here ---------------------------------------
@@ -1186,6 +1399,440 @@ done
 # operator's ham-remote configuration finds this machine.
 systemctl enable --now avahi-daemon >/dev/null 2>&1 || true
 ok "avahi kept, so the station answers to ${PI_HOSTNAME}.local"
+
+# --- keeping the Wi-Fi up ---------------------------------------------------
+
+# NetworkManager tries a failing connection four times and then stops trying
+# for good, until something outside it intervenes. On a machine nobody is in
+# front of, that is the difference between a thirty-second drop and a station
+# that is gone until someone visits. Zero means keep trying for ever.
+if have nmcli; then
+    while IFS=: read -r uuid ctype; do
+        [ "$ctype" = 802-11-wireless ] || continue
+        if [ "$(nmcli -g connection.autoconnect-retries connection show "$uuid" 2>/dev/null)" != 0 ]; then
+            nmcli connection modify "$uuid" connection.autoconnect-retries 0 &&
+                changed "wifi       $(nmcli -g connection.id connection show "$uuid") retries for ever instead of giving up"
+        fi
+    done < <(nmcli -t -f UUID,TYPE connection show 2>/dev/null || true)
+fi
+
+if [ "$WIFI_WATCHDOG" = yes ]; then
+    install_file /etc/ham-radio-pi/wifiwatch.conf 0644 root:root <<WATCHCONF
+# Settings for ham-radio-pi-wifiwatch, written by radio-pi-setup.sh.
+IFACE=wlan0
+REBOOT=$WIFI_WATCHDOG_REBOOT
+WATCHCONF
+
+    install_file /usr/local/sbin/ham-radio-pi-wifiwatch 0755 root:root <<'WIFIWATCH'
+#!/usr/bin/env bash
+#
+# ham-radio-pi-wifiwatch --- keep the radio-end Pi on the network, and write
+# down why it fell off.
+#
+# Every INTERVAL seconds it asks whether the Wi-Fi is really working: is the
+# interface there, is it joined to a network, does it have an address, does
+# the gateway answer. After CONFIRM failures in a row it treats it as an
+# outage and does two things, in this order:
+#
+#   1. Records the evidence, BEFORE touching anything: the kernel's log, the
+#      network manager's log, the link and address state, whether the network
+#      can still be seen at all. Recovery destroys most of this, so it comes
+#      first. One file per outage, in /var/log/ham-radio-pi/wifi-incidents/.
+#
+#   2. Recovers, in escalating steps, stopping at the first that works:
+#        reassociate         ask the network manager to rejoin
+#        restart-interface   Wi-Fi radio off and on again
+#        reload-driver       unload and reload the Wi-Fi driver, which
+#                            restarts its firmware
+#        reboot              last resort, rate limited, and never within the
+#                            first half hour after a boot
+#
+# Which step works is itself the diagnosis: a network manager that had given
+# up is fixed by the first, a driver whose firmware has hung only by the
+# third. `ham-radio-pi-wifiwatch --report` counts them.
+#
+# Settings are read from /etc/ham-radio-pi/wifiwatch.conf.
+#
+#   ham-radio-pi-wifiwatch            run (systemd does this)
+#   ham-radio-pi-wifiwatch --report   what has happened so far
+#   ham-radio-pi-wifiwatch --check    one health check, printed, then exit
+
+set -u
+
+IFACE=wlan0
+INTERVAL=20                 # seconds between checks
+CONFIRM=3                   # failures in a row before acting: about a minute
+SETTLE=45                   # seconds to wait for each recovery step to work
+REBOOT=yes                  # allow the last resort at all
+MAX_REBOOTS_PER_DAY=3
+MIN_UPTIME_FOR_REBOOT=1800  # a window after boot for a human, and no loops
+RETRY_WHILE_DOWN=300        # after every step has failed, try again this often
+KEEP_INCIDENTS=100
+LOGDIR=/var/log/ham-radio-pi
+STATEDIR=/var/lib/ham-radio-pi
+SYSNET=/sys/class/net
+CONF=/etc/ham-radio-pi/wifiwatch.conf
+
+# shellcheck source=/dev/null
+[ -r "$CONF" ] && . "$CONF"
+
+LOG=$LOGDIR/wifi-watch.log
+INCIDENTS=$LOGDIR/wifi-incidents
+REBOOTS=$STATEDIR/wifiwatch-reboots
+
+GATEWAY=""          # last IPv4 gateway seen, remembered across the outage
+PING_TRUSTED=0      # the gateway has answered at least once: some never do
+PROBLEM=""          # set by check(); empty means healthy
+DRIVER=""           # the kernel module behind the interface
+
+have() { command -v "$1" >/dev/null 2>&1; }
+
+log() {
+    printf '%s %s\n' "$(date -Is)" "$*" >> "$LOG"
+    logger -t wifiwatch -- "$*" 2>/dev/null || true
+}
+
+# The driver is looked up while the interface exists, because a firmware hang
+# can take the interface away and the name with it.
+remember_driver() {
+    local mod
+    mod=$(readlink -f "$SYSNET/$IFACE/device/driver/module" 2>/dev/null) || true
+    if [ -n "$mod" ]; then DRIVER=$(basename "$mod"); fi
+}
+
+# --------------------------------------------------------------------------
+# Is it working?
+# --------------------------------------------------------------------------
+
+# Sets PROBLEM to "<class>: <detail>", or to "" when the link is healthy. The
+# class names the layer that failed, which is the first clue to why.
+check() {
+    local v4 v6 gw
+    PROBLEM=""
+
+    if [ ! -e "$SYSNET/$IFACE" ]; then
+        PROBLEM="no-interface: $IFACE has disappeared (driver or firmware)"
+        return
+    fi
+    remember_driver
+
+    if ! iw dev "$IFACE" link 2>/dev/null | grep -q '^Connected to'; then
+        PROBLEM="not-associated: not joined to any network (operstate=$(cat "$SYSNET/$IFACE/operstate" 2>/dev/null))"
+        return
+    fi
+
+    v4=$(ip -4 -o addr show dev "$IFACE" 2>/dev/null | awk '{print $4; exit}')
+    v6=$(ip -6 -o addr show dev "$IFACE" scope global 2>/dev/null | awk '{print $4; exit}')
+    if [ -z "$v4" ] && [ -z "$v6" ]; then
+        PROBLEM="no-address: joined the network but has no IP address (DHCP)"
+        return
+    fi
+    if [ -z "$v4" ] && [ -n "$GATEWAY" ]; then
+        PROBLEM="lost-ipv4: IPv4 lease gone, IPv6 only ($v6)"
+        return
+    fi
+
+    gw=$(ip -4 route show default dev "$IFACE" 2>/dev/null | awk '{print $3; exit}')
+    if [ -n "$gw" ]; then GATEWAY=$gw; fi
+    if [ -z "$GATEWAY" ]; then return; fi
+
+    # Two tries: one lost ping on a busy network is not an outage.
+    if ping -c1 -W2 -I "$IFACE" "$GATEWAY" >/dev/null 2>&1 ||
+       ping -c1 -W3 -I "$IFACE" "$GATEWAY" >/dev/null 2>&1; then
+        PING_TRUSTED=1
+    elif [ "$PING_TRUSTED" = 1 ]; then
+        PROBLEM="gateway-silent: joined, with an address, but $GATEWAY stopped answering"
+    fi
+    # A gateway that has never answered is one that ignores pings, not a
+    # fault; it is simply not used as evidence.
+}
+
+wait_healthy() { # wait_healthy <seconds>
+    local deadline=$(( $(date +%s) + $1 ))
+    while [ "$(date +%s)" -lt "$deadline" ]; do
+        check
+        if [ -z "$PROBLEM" ]; then return 0; fi
+        sleep 5
+    done
+    return 1
+}
+
+# --------------------------------------------------------------------------
+# Evidence
+# --------------------------------------------------------------------------
+
+section() { printf '\n----- %s\n' "$*"; }
+
+capture() { # capture <file> <problem>
+    {
+        printf '===== Wi-Fi outage on %s\n' "$(hostname)"
+        printf 'detected: %s\n' "$(date -Is)"
+        printf 'problem:  %s\n' "$2"
+        printf 'uptime:   %s\n' "$(uptime)"
+        printf 'driver:   %s\n' "${DRIVER:-unknown}"
+
+        section "interface"
+        ip addr show dev "$IFACE" 2>&1
+        section "routes"
+        ip route 2>&1; ip -6 route 2>&1
+        section "link (iw)"
+        iw dev "$IFACE" link 2>&1
+        iw dev "$IFACE" info 2>&1
+        section "power save"
+        iw dev "$IFACE" get power_save 2>&1
+        section "/proc/net/wireless"
+        cat /proc/net/wireless 2>&1
+        section "rfkill"
+        rfkill list 2>&1
+
+        if have nmcli; then
+            section "NetworkManager: devices"
+            nmcli device status 2>&1
+            section "NetworkManager: $IFACE"
+            nmcli -f GENERAL,WIFI-PROPERTIES,IP4,IP6 device show "$IFACE" 2>&1
+            section "NetworkManager: connections"
+            nmcli -f NAME,TYPE,DEVICE,ACTIVE,AUTOCONNECT,AUTOCONNECT-RETRIES connection show 2>&1
+        fi
+
+        section "power supply (vcgencmd get_throttled; 0x0 is clean)"
+        vcgencmd get_throttled 2>&1 || echo "vcgencmd not available"
+        section "temperature"
+        cat /sys/class/thermal/thermal_zone0/temp 2>&1
+        section "wireless kernel modules"
+        lsmod 2>&1 | grep -iE 'brcm|cfg80211|mac80211' || true
+
+        # The kernel ring buffer is in memory and survives a volatile journal,
+        # but not a driver reload; this is the moment to take it.
+        section "kernel messages (last 200)"
+        dmesg -T 2>&1 | tail -200
+        section "NetworkManager and wpa_supplicant, last 30 minutes"
+        journalctl -b --since "-30min" --no-pager \
+            -u NetworkManager -u wpa_supplicant 2>&1 | tail -200
+
+        # Can it still see the network it lost? Distinguishes "the access
+        # point went away or changed channel" from "it is there and we will
+        # not rejoin". Scanning needs the interface up, so this may fail.
+        section "scan: networks visible now"
+        timeout 20 iw dev "$IFACE" scan 2>&1 \
+            | grep -E '^BSS|SSID:|signal:|DS Parameter set|freq:' | head -60
+    } > "$1" 2>&1
+}
+
+prune_incidents() {
+    ls -1t "$INCIDENTS"/*.log 2>/dev/null | tail -n +$((KEEP_INCIDENTS + 1)) | xargs -r rm -f
+}
+
+# --------------------------------------------------------------------------
+# Recovery
+# --------------------------------------------------------------------------
+
+nm_connect() {
+    if have nmcli; then nmcli --wait 30 device connect "$IFACE" 2>&1; fi
+}
+
+step_reassociate() {
+    # Rejoining resets NetworkManager's own bookkeeping, including its
+    # decision to stop retrying a connection that failed a few times -- the
+    # commonest reason Wi-Fi goes down and stays down.
+    if have nmcli; then
+        nm_connect
+    elif have wpa_cli; then
+        wpa_cli -i "$IFACE" reassociate 2>&1
+    fi
+}
+
+step_restart_interface() {
+    if have nmcli; then
+        nmcli radio wifi off 2>&1; sleep 3
+        nmcli radio wifi on 2>&1;  sleep 5
+        nm_connect
+    else
+        ip link set "$IFACE" down 2>&1; sleep 3
+        ip link set "$IFACE" up 2>&1
+    fi
+}
+
+step_reload_driver() {
+    local drv=${DRIVER:-brcmfmac} m
+    echo "reloading driver $drv"
+    # Vendor helper modules (brcmfmac_wcc, brcmfmac_cyw ...) hold a reference
+    # to the main one and must go first.
+    for m in $(lsmod | awk -v d="$drv" '$1 != d && index($1, d "_") == 1 {print $1}'); do
+        modprobe -r "$m" 2>&1
+    done
+    modprobe -r "$drv" 2>&1
+    sleep 3
+    modprobe "$drv" 2>&1
+    sleep 10
+    nm_connect
+}
+
+reboot_permitted() {
+    local up now count
+    if [ "$REBOOT" != yes ]; then
+        log "  not rebooting: disabled in $CONF"
+        return 1
+    fi
+    up=$(awk '{printf "%d", $1}' /proc/uptime)
+    if [ "$up" -lt "$MIN_UPTIME_FOR_REBOOT" ]; then
+        log "  not rebooting: up only ${up}s (waits until ${MIN_UPTIME_FOR_REBOOT}s)"
+        return 1
+    fi
+    now=$(date +%s)
+    count=$(awk -v n="$now" '$1 > n - 86400' "$REBOOTS" 2>/dev/null | wc -l)
+    if [ "$count" -ge "$MAX_REBOOTS_PER_DAY" ]; then
+        log "  not rebooting: already rebooted $count times in 24 hours"
+        return 1
+    fi
+    return 0
+}
+
+handle_outage() {
+    local start first incident step took
+    start=$(date +%s)
+    first=$PROBLEM
+    incident="$INCIDENTS/$(date +%Y%m%d-%H%M%S).log"
+
+    log "OUTAGE: $first"
+    capture "$incident" "$first"
+    log "  evidence: $incident"
+
+    for step in reassociate restart-interface reload-driver; do
+        log "  trying $step"
+        printf '\n===== %s trying %s\n' "$(date -Is)" "$step" >> "$incident"
+        "step_${step//-/_}" >> "$incident" 2>&1
+        if wait_healthy "$SETTLE"; then
+            took=$(( $(date +%s) - start ))
+            log "RECOVERED by $step after ${took}s -- cause was $first"
+            {
+                printf '\n===== %s RECOVERED by %s after %ss\n' "$(date -Is)" "$step" "$took"
+                iw dev "$IFACE" link 2>&1
+                ip -4 addr show dev "$IFACE" 2>&1
+            } >> "$incident"
+            prune_incidents
+            return
+        fi
+        printf '===== still down: %s\n' "$PROBLEM" >> "$incident"
+    done
+
+    # Nothing brought it back. Reboot if allowed; otherwise keep trying,
+    # quietly, into the same incident file rather than a new one each time.
+    while :; do
+        if reboot_permitted; then
+            log "REBOOTING: every recovery step failed -- cause was $first"
+            printf '\n===== %s REBOOTING\n' "$(date -Is)" >> "$incident"
+            date +%s >> "$REBOOTS"
+            sync
+            systemctl reboot
+            sleep 120
+        fi
+        log "  still down; trying again in ${RETRY_WHILE_DOWN}s"
+        sleep "$RETRY_WHILE_DOWN"
+        check
+        if [ -z "$PROBLEM" ]; then
+            log "RECOVERED on its own after $(( $(date +%s) - start ))s -- cause was $first"
+            return
+        fi
+        printf '\n===== %s retrying reload-driver (%s)\n' "$(date -Is)" "$PROBLEM" >> "$incident"
+        step_reload_driver >> "$incident" 2>&1
+        if wait_healthy "$SETTLE"; then
+            log "RECOVERED by reload-driver (retry) after $(( $(date +%s) - start ))s -- cause was $first"
+            return
+        fi
+    done
+}
+
+# --------------------------------------------------------------------------
+
+report() {
+    if [ ! -r "$LOG" ]; then echo "No log yet at $LOG."; exit 0; fi
+
+    echo "== Outages, by what failed =="
+    grep ' OUTAGE: ' "$LOG" | sed 's/.* OUTAGE: //; s/:.*//' | sort | uniq -c | sort -rn \
+        | sed 's/^/  /' | grep . || echo "  none"
+
+    echo
+    echo "== What brought it back =="
+    grep ' RECOVERED ' "$LOG" | sed 's/.* RECOVERED //; s/ after.*//; s/^by //' \
+        | sort | uniq -c | sort -rn | sed 's/^/  /' | grep . || echo "  nothing yet"
+    local n
+    n=$(grep -c ' REBOOTING' "$LOG" 2>/dev/null || true)
+    echo "  reboot: ${n:-0}"
+
+    echo
+    echo "== The last 15 events =="
+    grep -E ' (OUTAGE|RECOVERED|REBOOTING|started)' "$LOG" | tail -15 | sed 's/^/  /'
+
+    echo
+    echo "== Evidence files, newest first =="
+    ls -1t "$INCIDENTS"/*.log 2>/dev/null | head -10 | sed 's/^/  /' || echo "  none"
+    cat <<'EOF'
+
+Reading it:
+  not-associated, fixed by reassociate   the network manager had given up
+                                         rejoining, or the router dropped it
+  not-associated, fixed by reload-driver the Wi-Fi firmware had stopped
+  no-interface                           driver or firmware crash
+  no-address                             joined, but DHCP failed: look at
+                                         the router
+  gateway-silent                         joined with an address but traffic
+                                         stopped: firmware, or interference
+Each evidence file begins with the kernel's messages at the moment of failure.
+EOF
+}
+
+main() {
+    mkdir -p "$INCIDENTS" "$STATEDIR"
+    local fails=0
+    remember_driver
+    log "started: watching $IFACE every ${INTERVAL}s (driver ${DRIVER:-unknown}, reboot=$REBOOT)"
+    while :; do
+        check
+        if [ -z "$PROBLEM" ]; then
+            fails=0
+        else
+            fails=$((fails + 1))
+            if [ "$fails" -ge "$CONFIRM" ]; then
+                handle_outage
+                fails=0
+            fi
+        fi
+        sleep "$INTERVAL"
+    done
+}
+
+case "${1:-}" in
+    --report) report ;;
+    --check)  check; echo "${PROBLEM:-healthy}" ;;
+    "")       main ;;
+    *)        echo "usage: $0 [--report|--check]" >&2; exit 1 ;;
+esac
+WIFIWATCH
+
+    install_file /etc/systemd/system/ham-radio-pi-wifiwatch.service <<'WATCHUNIT'
+[Unit]
+Description=ham-radio-pi Wi-Fi watchdog: reconnects, and records why it dropped
+After=network.target NetworkManager.service
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+ExecStart=/usr/local/sbin/ham-radio-pi-wifiwatch
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
+WATCHUNIT
+    ok "wifi watch every 20s; last-resort reboot: $WIFI_WATCHDOG_REBOOT"
+else
+    if [ -f /etc/systemd/system/ham-radio-pi-wifiwatch.service ]; then
+        systemctl disable --now ham-radio-pi-wifiwatch.service >/dev/null 2>&1 || true
+        rm -f /etc/systemd/system/ham-radio-pi-wifiwatch.service
+        changed "removed    the Wi-Fi watchdog"
+    fi
+fi
+
 
 # --------------------------------------------------------------------------
 # Emacs
@@ -1378,6 +2025,10 @@ head_ "Starting the station"
 
 systemctl daemon-reload
 systemctl enable rigctld.service mumble-radio.service >/dev/null 2>&1 || true
+if [ "$WIFI_WATCHDOG" = yes ]; then
+    systemctl enable ham-radio-pi-wifiwatch.service >/dev/null 2>&1 || true
+    systemctl restart ham-radio-pi-wifiwatch.service || warn "the Wi-Fi watchdog did not start."
+fi
 
 systemctl restart "$MS_SERVICE" || warn "$MS_SERVICE did not start."
 systemctl restart rigctld.service || warn "rigctld did not start."
@@ -1422,6 +2073,8 @@ check_service() {
 check_service "$MS_SERVICE"
 check_service rigctld.service
 check_service mumble-radio.service
+if [ "$WIFI_WATCHDOG" = yes ]; then check_service ham-radio-pi-wifiwatch.service; fi
+if [ -x "$RIGCTLD_BIN" ]; then ok "hamlib     $(hamlib_installed_version), $RIGCTLD_BIN"; fi
 
 # Writing the digest somewhere is not the same as writing it where the
 # client reads it. Ask the running process which file it actually opened.
@@ -1462,7 +2115,7 @@ fi
 
 # Hamlib model 2 is "NET rigctl": rigctl talking to rigctld, which is exactly
 # what the operator's Emacs does.
-if FREQ=$(timeout 10 rigctl -m 2 -r "127.0.0.1:$RIGCTLD_PORT" f 2>/dev/null); then
+if FREQ=$(timeout 10 "$RIGCTL_BIN" -m 2 -r "127.0.0.1:$RIGCTLD_PORT" f 2>/dev/null); then
     ok "radio      answered: $FREQ Hz"
 else
     warn "rigctld is up but the radio did not answer."
@@ -1512,12 +2165,14 @@ cat <<SUMMARY
 $C_HEAD== The station ==$C_OFF
 
    Radio        ${RIG_MODEL_NAME:-model $RIG_MODEL} (Hamlib model $RIG_MODEL) on $RIG_DEVICE
-   rigctld      ${RIGCTLD_BIND}:${RIGCTLD_PORT}  (${RIGCTLD_SCOPE})
+   rigctld      ${RIGCTLD_BIND}:${RIGCTLD_PORT}  (${RIGCTLD_SCOPE}), Hamlib $(hamlib_installed_version)
    Mumble       port $MUMBLE_PORT, TCP and UDP, up to $MUMBLE_USERS clients
    Radio client joins as "$MUMBLE_RADIO_USER", transmitting continuously
    Audio        in $AUDIO_CAPTURE
                 out $AUDIO_PLAYBACK
    Reachable at ${PI_HOSTNAME}.local${IP:+ / $IP}
+   Wi-Fi watch  $WIFI_WATCHDOG (last-resort reboot: $WIFI_WATCHDOG_REBOOT)
+                after an outage:  sudo ham-radio-pi-wifiwatch --report
 
 $C_HEAD== Logging in ==$C_OFF
 
