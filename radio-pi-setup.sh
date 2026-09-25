@@ -50,11 +50,10 @@ RESET_PASSWORD=0
 SKIP_APT=0
 REBUILD_HAMLIB=0
 
-# Hamlib is built from the upstream release, not taken from Debian, whose
-# Hamlib lags by years (Bookworm ships 4.5.4). The checksum is of the release
-# tarball as published on both GitHub and SourceForge, which agree.
-HAMLIB_PINNED_VERSION="4.7.2"
-HAMLIB_PINNED_SHA256="ae1fcf2dbc80ea0786ea8f047b09399c3f7737d1930442f61a031708ed33e88f"
+# Hamlib is built from the latest stable release on GitHub, looked up each
+# time the script runs, rather than taken from Debian, whose Hamlib lags by
+# years (Bookworm ships 4.5.4).
+HAMLIB_REPO="Hamlib/Hamlib"
 HAMLIB_PREFIX=/usr/local
 RIGCTLD_BIN=$HAMLIB_PREFIX/bin/rigctld
 RIGCTL_BIN=$HAMLIB_PREFIX/bin/rigctl
@@ -315,16 +314,16 @@ apt_install_gui() {
 # Hamlib, built from source
 # --------------------------------------------------------------------------
 #
+# The version is the latest stable release on GitHub, found when the script
+# runs: GitHub's "latest release" is the newest one that is neither a draft
+# nor a pre-release, which is exactly what stable means here. A re-run after
+# a new release builds it; a re-run without one does nothing. HAMLIB_VERSION
+# in setup.conf pins a particular version instead.
+#
 # Installed under /usr/local and linked with a run path to its own library,
 # so that it cannot pick up Debian's older libhamlib.so.4 by accident: both
 # have the same soname, and the dynamic linker's search order would otherwise
 # decide which one rigctld got.
-#
-# A re-run with the same version does nothing. A new version is a new
-# HAMLIB_VERSION in setup.conf (with its HAMLIB_SHA256), or a newer copy of
-# this script.
-
-HAMLIB_VERSION_WANTED=${HAMLIB_VERSION:-$HAMLIB_PINNED_VERSION}
 
 # Prints the installed version, or nothing. It must never fail: it is called
 # in assignments, where under set -e and pipefail a missing rigctld -- the
@@ -335,9 +334,135 @@ hamlib_installed_version() {
     fi
 }
 
+# A release version, as Hamlib tags them: 4.7.2, 4.6. Anything else -- a
+# pre-release tag, an error page -- is refused rather than built.
+hamlib_version_ok() {
+    printf '%s' "${1:-}" | grep -qE '^[0-9]+(\.[0-9]+)+$'
+}
+
+# Releases whose tarballs have been checked by hand, as a further check on
+# top of the comparison with SourceForge. Not required: a release missing
+# here is still verified, just against one source fewer.
+hamlib_known_sha256() {
+    case "$1" in
+        4.7.2) echo ae1fcf2dbc80ea0786ea8f047b09399c3f7737d1930442f61a031708ed33e88f ;;
+    esac
+}
+
+# The latest stable release, or nothing if GitHub cannot be asked. The web
+# page's redirect first, which has no rate limit; the API second.
+hamlib_latest_release() {
+    local tag
+    tag=$(curl -fsS -m 30 -o /dev/null -w '%{redirect_url}' \
+               "https://github.com/$HAMLIB_REPO/releases/latest" 2>/dev/null || true)
+    tag=${tag##*/tag/}
+    if ! hamlib_version_ok "$tag"; then
+        tag=$(curl -fsS -m 30 -H 'Accept: application/vnd.github+json' \
+                   "https://api.github.com/repos/$HAMLIB_REPO/releases/latest" 2>/dev/null |
+              sed -n 's/^[[:space:]]*"tag_name":[[:space:]]*"\([^"]*\)".*/\1/p' |
+              head -1 || true)
+    fi
+    if hamlib_version_ok "$tag"; then printf '%s' "$tag"; fi
+}
+
+# Settles HAMLIB_VERSION_WANTED and HAMLIB_WANTED_WHY.
+choose_hamlib_version() {
+    local setting=${HAMLIB_VERSION:-latest} latest installed
+    installed=$(hamlib_installed_version)
+
+    if [ "$setting" != latest ]; then
+        hamlib_version_ok "$setting" ||
+            die "HAMLIB_VERSION=\"$setting\" in $CONF_FILE is not a release version."
+        HAMLIB_VERSION_WANTED=$setting
+        HAMLIB_WANTED_WHY="pinned in $CONF_FILE"
+        return 0
+    fi
+
+    say "asking GitHub for the latest stable Hamlib release"
+    latest=$(hamlib_latest_release)
+    if [ -n "$latest" ]; then
+        HAMLIB_VERSION_WANTED=$latest
+        HAMLIB_WANTED_WHY="latest stable release on GitHub"
+        ok "latest stable release: $latest (installed: ${installed:-none})"
+    elif [ -n "$installed" ]; then
+        # No network is no reason to break a station that works.
+        warn "Could not reach GitHub to find the latest Hamlib release."
+        warn "Keeping the installed $installed; re-run when the network is back."
+        HAMLIB_VERSION_WANTED=$installed
+        HAMLIB_WANTED_WHY="installed; GitHub could not be reached"
+    else
+        die "Could not reach GitHub to find the latest Hamlib release, and no
+       Hamlib is installed yet. Check the Pi's network and run this again,
+       or name a version in $CONF_FILE:  HAMLIB_VERSION=\"4.7.2\""
+    fi
+}
+
+# Downloads the release tarball and makes sure it is the one Hamlib
+# published. With no checksum to compare against in advance -- the script
+# does not know what the latest release will be -- the GitHub copy is
+# compared with the one Hamlib publishes separately on SourceForge. Two
+# independent hosts serving the same bytes is good evidence neither has been
+# tampered with; if they differ, nothing is built.
+fetch_hamlib_tarball() { # fetch_hamlib_tarball <version> <tarball>
+    local v=$1 tarball=$2 want got other tmp
+    local gh="https://github.com/$HAMLIB_REPO/releases/download/$v/hamlib-$v.tar.gz"
+    local sf="https://sourceforge.net/projects/hamlib/files/hamlib/$v/hamlib-$v.tar.gz/download"
+
+    want=${HAMLIB_SHA256:-}
+    if [ -z "$want" ]; then want=$(hamlib_known_sha256 "$v"); fi
+
+    # A tarball kept from an earlier run is reused if it still matches the
+    # checksum recorded when it was verified.
+    if [ -s "$tarball" ] && [ -s "$tarball.sha256" ] &&
+       [ "$(sha256sum "$tarball" | awk '{print $1}')" = "$(cat "$tarball.sha256")" ]; then
+        if [ -z "$want" ] || [ "$want" = "$(cat "$tarball.sha256")" ]; then
+            ok "Hamlib $v tarball, verified on an earlier run"
+            return 0
+        fi
+    fi
+    rm -f "$tarball" "$tarball.sha256"
+
+    say "downloading Hamlib $v from GitHub"
+    if ! curl -fsSL --retry 3 -m 300 -o "$tarball.part" "$gh"; then
+        rm -f "$tarball.part"
+        die "Could not download $gh"
+    fi
+    if ! gzip -t "$tarball.part" 2>/dev/null; then
+        rm -f "$tarball.part"
+        die "What GitHub returned for Hamlib $v is not a tarball."
+    fi
+    mv "$tarball.part" "$tarball"
+    got=$(sha256sum "$tarball" | awk '{print $1}')
+
+    if [ -n "$want" ]; then
+        if [ "$got" != "$want" ]; then
+            rm -f "$tarball"
+            die "Hamlib $v failed its checksum: got $got, expected $want."
+        fi
+        ok "Hamlib $v tarball, checksum verified"
+    else
+        tmp=$(mktemp)
+        if curl -fsSL --retry 2 -m 300 -o "$tmp" "$sf" 2>/dev/null && gzip -t "$tmp" 2>/dev/null; then
+            other=$(sha256sum "$tmp" | awk '{print $1}')
+            rm -f "$tmp"
+            if [ "$other" != "$got" ]; then
+                rm -f "$tarball"
+                die "Hamlib $v differs between GitHub ($got) and SourceForge
+       ($other). Not building something whose origin is in doubt."
+            fi
+            ok "Hamlib $v tarball, identical on GitHub and SourceForge"
+        else
+            rm -f "$tmp"
+            warn "SourceForge has no copy of Hamlib $v to compare against yet,"
+            warn "so it is trusted as downloaded from GitHub over HTTPS."
+        fi
+    fi
+    printf '%s\n' "$got" > "$tarball.sha256"
+    note "sha256 $got"
+}
+
 build_hamlib() {
-    local v=$HAMLIB_VERSION_WANTED want got src tarball log jobs mem_mb
-    local have_v
+    local v=$HAMLIB_VERSION_WANTED src tarball log jobs mem_mb have_v
     have_v=$(hamlib_installed_version)
 
     if [ "$have_v" = "$v" ] && [ "$REBUILD_HAMLIB" = 0 ]; then
@@ -349,51 +474,17 @@ build_hamlib() {
         return 0
     fi
 
-    apt_install build-essential pkg-config libreadline-dev libusb-1.0-0-dev \
-                curl ca-certificates
-
-    if [ "$v" = "$HAMLIB_PINNED_VERSION" ]; then
-        want=$HAMLIB_PINNED_SHA256
-    else
-        want=${HAMLIB_SHA256:-}
-    fi
+    apt_install build-essential pkg-config libreadline-dev libusb-1.0-0-dev
 
     src=/usr/local/src/hamlib
     mkdir -p "$src"
     tarball=$src/hamlib-$v.tar.gz
-
-    # A tarball kept from an earlier run is reused only if it still checks out.
-    if [ -s "$tarball" ] && [ -n "$want" ] &&
-       [ "$(sha256sum "$tarball" | awk '{print $1}')" != "$want" ]; then
-        rm -f "$tarball"
-    fi
-    if [ ! -s "$tarball" ]; then
-        say "downloading Hamlib $v"
-        if ! curl -fsSL --retry 3 -o "$tarball.part" \
-                "https://github.com/Hamlib/Hamlib/releases/download/$v/hamlib-$v.tar.gz" &&
-           ! curl -fsSL --retry 3 -o "$tarball.part" \
-                "https://sourceforge.net/projects/hamlib/files/hamlib/$v/hamlib-$v.tar.gz/download"; then
-            rm -f "$tarball.part"
-            die "Could not download Hamlib $v from GitHub or SourceForge."
-        fi
-        mv "$tarball.part" "$tarball"
-    fi
-
-    got=$(sha256sum "$tarball" | awk '{print $1}')
-    if [ -n "$want" ]; then
-        if [ "$got" != "$want" ]; then
-            rm -f "$tarball"
-            die "Hamlib $v failed its checksum: got $got, expected $want."
-        fi
-        ok "Hamlib $v tarball, checksum verified"
-    else
-        warn "No checksum is known for Hamlib $v, so what was downloaded is"
-        warn "being trusted as is (sha256 $got). To pin it, add to $CONF_FILE:"
-        warn "  HAMLIB_SHA256=\"$got\""
-    fi
+    fetch_hamlib_tarball "$v" "$tarball"
 
     rm -rf "$src/hamlib-$v"
     tar -xzf "$tarball" -C "$src"
+    [ -x "$src/hamlib-$v/configure" ] ||
+        die "The Hamlib $v tarball has no configure script; it cannot be built as is."
 
     # Parallel compiles by memory, not by cores: a Zero 2W has four cores
     # and 512MB, and four compilers at once can run it out.
@@ -430,6 +521,8 @@ build_hamlib() {
     fi
 
     rm -rf "${src:?}/hamlib-$v"      # the build tree; the tarball is kept
+    # Tarballs of versions no longer in use are only disk space.
+    find "$src" -maxdepth 1 -name 'hamlib-*.tar.gz*' ! -name "hamlib-$v.tar.gz*" -delete 2>/dev/null || true
     changed "built      Hamlib $v in $HAMLIB_PREFIX"
 }
 
@@ -457,10 +550,17 @@ remove_distro_hamlib() {
     done
 }
 
+head_ "Hamlib"
 if [ "$SKIP_APT" = 0 ]; then
-    head_ "Installing Hamlib $HAMLIB_VERSION_WANTED"
     DEBIAN_FRONTEND=noninteractive apt-get update
-    apt_install alsa-utils openssl ca-certificates
+    apt_install alsa-utils openssl ca-certificates curl
+fi
+if have curl; then
+    choose_hamlib_version
+else
+    HAMLIB_VERSION_WANTED=$(hamlib_installed_version)
+    HAMLIB_WANTED_WHY="installed; curl is not available to ask GitHub"
+    [ -n "$HAMLIB_VERSION_WANTED" ] || die "curl is needed to find and fetch Hamlib."
 fi
 build_hamlib
 if [ "$(hamlib_installed_version)" = "$HAMLIB_VERSION_WANTED" ]; then
@@ -807,11 +907,11 @@ CPU_GOVERNOR="$CPU_GOVERNOR"
 # that stops the machine; volatile keeps it in RAM and saves the SD card.
 JOURNAL_STORAGE="${JOURNAL_STORAGE:-persistent}"
 
-# Hamlib is built from source. Empty means the version this script pins
-# (${HAMLIB_PINNED_VERSION}). To choose another, give both lines:
-#   HAMLIB_VERSION="4.7.3"
-#   HAMLIB_SHA256="<sha256 of hamlib-4.7.3.tar.gz>"
-HAMLIB_VERSION="${HAMLIB_VERSION:-}"
+# Hamlib is built from source. "latest" follows the latest stable release on
+# GitHub: each run checks, and builds a new release when there is one. A
+# version number pins that version instead, e.g. HAMLIB_VERSION="4.7.2".
+# HAMLIB_SHA256, if set, must match the pinned version's tarball.
+HAMLIB_VERSION="${HAMLIB_VERSION:-latest}"
 HAMLIB_SHA256="${HAMLIB_SHA256:-}"
 CONSOLE_BLANK="$CONSOLE_BLANK"
 DISABLE_BT="$DISABLE_BT"
@@ -2165,7 +2265,8 @@ cat <<SUMMARY
 $C_HEAD== The station ==$C_OFF
 
    Radio        ${RIG_MODEL_NAME:-model $RIG_MODEL} (Hamlib model $RIG_MODEL) on $RIG_DEVICE
-   rigctld      ${RIGCTLD_BIND}:${RIGCTLD_PORT}  (${RIGCTLD_SCOPE}), Hamlib $(hamlib_installed_version)
+   rigctld      ${RIGCTLD_BIND}:${RIGCTLD_PORT}  (${RIGCTLD_SCOPE})
+   Hamlib       $(hamlib_installed_version) -- ${HAMLIB_WANTED_WHY:-}
    Mumble       port $MUMBLE_PORT, TCP and UDP, up to $MUMBLE_USERS clients
    Radio client joins as "$MUMBLE_RADIO_USER", transmitting continuously
    Audio        in $AUDIO_CAPTURE

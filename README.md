@@ -109,8 +109,8 @@ The first run is long: Hamlib is compiled from source, which on a Pi Zero 2W
 takes twenty to forty-five minutes, and then `apt` fetches Mumble. Hamlib has
 to come first, because the list of radios the script offers is that Hamlib's
 own list, so the questions come after the build. Once you have answered them
-the rest runs unattended. A re-run skips the build unless the Hamlib version
-has changed.
+the rest runs unattended. A re-run skips the build unless Hamlib has
+published a new stable release since.
 
 Answers are saved in `/etc/ham-radio-pi/setup.conf`. Every file it replaces is
 copied to `/etc/ham-radio-pi/backups/` first.
@@ -369,11 +369,38 @@ power saving, not a screensaver; nothing is logged out.
 
 ## Hamlib, built from source
 
-The script builds Hamlib from the upstream release rather than installing
-Debian's, which lags by years: Bookworm ships 4.5.4, and fixes in `rigctld`
-and in individual radio backends since then are exactly what `ham-rig` runs
-into. It builds **4.7.2**, from the release tarball, checked against a pinned
-SHA-256 &mdash; the same one GitHub and SourceForge both publish.
+The Pi runs **the latest stable release of Hamlib on GitHub**
+(<https://github.com/Hamlib/Hamlib>), built from source, rather than Debian's,
+which lags by years: Bookworm ships 4.5.4, and fixes in `rigctld` and in
+individual radio backends since then are exactly what `ham-rig` runs into.
+
+**The version is looked up when the script runs**, not written into it.
+GitHub's "latest release" is the newest release that is neither a draft nor a
+pre-release, which is what stable means here. So:
+
+- the first run builds whatever that is today;
+- a re-run after Hamlib publishes a new release builds the new one;
+- a re-run with no new release does nothing.
+
+The summary says which it did:
+
+```
+   Hamlib       4.7.2 -- latest stable release on GitHub
+```
+
+**If GitHub cannot be reached** &mdash; which, given this station's Wi-Fi, is
+worth planning for &mdash; the script keeps the Hamlib already installed, says
+so, and carries on. A station that works is never broken by an upgrade that
+could not happen. Only a first run, with no Hamlib yet, has to stop.
+
+**Checking what is downloaded.** The script cannot hold a checksum for a
+release that did not exist when it was written. Instead it compares the
+tarball from GitHub with the copy Hamlib publishes separately on SourceForge:
+two independent hosts serving identical bytes is good evidence neither has
+been tampered with, and if they differ nothing is built. Releases already
+checked by hand (4.7.2 is) are also compared against their known checksum. A
+release too new to have reached SourceForge is built from the GitHub copy,
+fetched over HTTPS from the repository above, with a warning saying so.
 
 It goes into `/usr/local`, and `rigctld` is linked with a run path to its own
 library. That matters: Debian's `libhamlib.so.4` and ours have the same name,
@@ -387,25 +414,28 @@ else needs it &mdash; fldigi or WSJT-X, say &mdash; which is harmless, since our
 `rigctld` does not use it.
 
 ```
-rigctld --version          # Hamlib 4.7.2
-ldd /usr/local/bin/rigctld | grep hamlib    # /usr/local/lib/libhamlib.so.4
+rigctld --version                              # the version built
+ldd /usr/local/bin/rigctld | grep hamlib       # /usr/local/lib/libhamlib.so.4
 ```
 
 **Model numbers do not change** between Hamlib versions: the FTDX-10 is 1042
-in 4.5.4 and in 4.7.2, so a station set up on the old version keeps its saved
-answers.
+in 4.5.4 and in 4.7.2, so a station keeps its saved answers across upgrades.
 
-**Another version.** Put both lines in `/etc/ham-radio-pi/setup.conf` and
-re-run:
+**To stay on one version** instead of following new releases, name it in
+`/etc/ham-radio-pi/setup.conf`:
 
 ```
-HAMLIB_VERSION="4.7.3"
-HAMLIB_SHA256="<the sha256 of hamlib-4.7.3.tar.gz>"
+HAMLIB_VERSION="4.7.2"
 ```
 
-Without a checksum it still builds, and prints the sum of what it downloaded
-so you can pin it. `sudo apt upgrade` never touches this Hamlib; a new version
-is always a deliberate re-run.
+and, optionally, the tarball's checksum as `HAMLIB_SHA256`. Set it back to
+`"latest"` to follow releases again.
+
+**Upgrading is deliberate.** Nothing checks for new Hamlib releases in the
+background, and `apt upgrade` never touches this Hamlib: a new release is
+built when you re-run the script. That is on purpose &mdash; a build takes up
+to three-quarters of an hour on a Zero 2W and ends by restarting `rigctld`,
+which is not something to have happen in the middle of a contact.
 
 If a build fails, the script stops and names the log
 (`/usr/local/src/hamlib/build-<version>.log`); nothing is removed, so a
@@ -529,7 +559,8 @@ sudo bash radio-pi-setup.sh --unattended
 sudo reboot
 ```
 
-is the whole upgrade procedure. `--unattended` uses the answers saved last
+is the whole upgrade procedure, Hamlib included: if a new stable Hamlib has
+been released, this is when it is built. `--unattended` uses the answers saved last
 time; leave it off to be asked again, with your previous answers as the
 defaults.
 
@@ -537,8 +568,8 @@ Two things a re-run does **not** do:
 
 - It does not reset your login password. Use `--reset-password` for that.
 - It does not regenerate the Mumble certificate or the SuperUser password.
-- It does not rebuild Hamlib, unless the version wanted has changed or you
-  pass `--rebuild-hamlib`.
+- It does not rebuild Hamlib unless there is a new stable release on GitHub
+  (or you pass `--rebuild-hamlib`).
 
 One thing it **does** overwrite: the radio-end Mumble client's configuration,
 `~/.config/Mumble/Mumble.conf`. Those settings are the station's, not yours;
