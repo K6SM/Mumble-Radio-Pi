@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
+# radio-pi-setup.sh  version 0.5.1  (2026-09-25)
 #
-# radio-pi-setup.sh --- set up a Raspberry Pi as the radio-end computer of a
-# remote amateur radio station.
+# Sets up a Raspberry Pi as the radio-end computer of a remote amateur radio
+# station.
 #
 # It installs and configures, so that all three come up at boot:
 #
@@ -32,9 +33,11 @@
 #
 # License: same terms as the K6SM ham.el package.
 
-set -euo pipefail
+# -E: the error trap below also fires inside functions, so a failure anywhere
+# is reported rather than ending the script without a word.
+set -Eeuo pipefail
 
-VERSION="1.0"
+VERSION="0.5.1"
 CONF_DIR="/etc/ham-radio-pi"
 CONF_FILE="$CONF_DIR/setup.conf"
 BACKUP_DIR="$CONF_DIR/backups"
@@ -76,8 +79,25 @@ say()    { printf '   %s\n' "$*"; }
 ok()     { printf '   %s+%s %s\n' "$C_OK" "$C_OFF" "$*"; }
 note()   { printf '   %s. %s%s\n' "$C_DIM" "$*" "$C_OFF"; }
 warn()   { printf '   %s! %s%s\n' "$C_WARN" "$*" "$C_OFF" >&2; }
-die()    { printf '\n%sError:%s %s\n\n' "$C_ERR" "$C_OFF" "$*" >&2; exit 1; }
+DIED=0
+die()    { DIED=1; printf '\n%sError:%s %s\n\n' "$C_ERR" "$C_OFF" "$*" >&2; exit 1; }
 changed(){ CHANGES+=("$1"); ok "$1"; }
+
+# Any command that fails outside an if, a while, && or || ends the script
+# (set -e). This says so, and where, instead of ending it without a word.
+# It is set up here, before anything else can fail.
+ERR_REPORTED=0
+on_err() { # on_err <status> <line> <command>
+    # Only the script itself reports: a failure inside $(...) is reported
+    # once, by the line that used it.
+    [ "${BASH_SUBSHELL:-0}" -eq 0 ] || return 0
+    [ "$ERR_REPORTED" = 0 ] || return 0
+    ERR_REPORTED=1
+    printf '\n%sStopped:%s line %s failed with status %s:\n    %s\n' \
+        "$C_ERR" "$C_OFF" "$2" "$1" "$3" >&2
+    printf '   The run stopped there; nothing after that point was done.\n' >&2
+}
+trap 'on_err "$?" "$LINENO" "$BASH_COMMAND"' ERR
 
 # --------------------------------------------------------------------------
 # Asking
@@ -95,7 +115,9 @@ ask() { # ask <prompt> <default> -> answer on stdout
     else
         printf '   %s: ' "$prompt" > "$TTY_IN"
     fi
-    IFS= read -r reply < "$TTY_IN" || reply=""
+    # A read that fails means the terminal has gone (an SSH connection
+    # dropped); carrying on with defaults nobody chose would be worse.
+    IFS= read -r reply < "$TTY_IN" || die "Lost the terminal while asking \"$prompt\"."
     printf '%s' "${reply:-$default}"
 }
 
@@ -107,7 +129,7 @@ ask_yn() { # ask_yn <prompt> <yes|no default> -> returns 0 for yes
     fi
     while :; do
         printf '   %s (%s): ' "$prompt" "$hint" > "$TTY_IN"
-        IFS= read -r reply < "$TTY_IN" || reply=""
+        IFS= read -r reply < "$TTY_IN" || die "Lost the terminal while asking \"$prompt\"."
         reply=${reply:-$default}
         case "${reply,,}" in
             y|yes) return 0 ;;
@@ -211,6 +233,7 @@ radio-pi-setup.sh $VERSION -- radio-end Raspberry Pi for remote operating
                       services.
   --rebuild-hamlib    Build Hamlib again even if the wanted version is
                       already installed.
+  --version           Print the version and stop.
   -h, --help          This text.
 USAGE
 }
@@ -222,6 +245,7 @@ while [ $# -gt 0 ]; do
         --skip-apt)       SKIP_APT=1 ;;
         --rebuild-hamlib) REBUILD_HAMLIB=1 ;;
         -h|--help)        usage; exit 0 ;;
+        --version)        echo "radio-pi-setup.sh $VERSION"; exit 0 ;;
         *)                usage; die "Unknown option: $1" ;;
     esac
     shift
@@ -234,6 +258,84 @@ done
 head_ "Checking the machine"
 
 [ "$(id -u)" = 0 ] || die "Run this with sudo: sudo bash $0"
+
+# --------------------------------------------------------------------------
+# How a run ends
+# --------------------------------------------------------------------------
+#
+# Every run is written to its own log, and however it ends -- finished,
+# failed, interrupted, or an SSH connection dropped -- it says which, and
+# where the log is.
+
+LOG_DIR=/var/log/ham-radio-pi
+RUN_LOG="$LOG_DIR/setup-$STAMP.log"
+mkdir -p "$LOG_DIR"
+# The newest twenty runs are plenty. (ls fails when there are none yet, which
+# under pipefail would end the script: hence || true.)
+ls -1t "$LOG_DIR"/setup-*.log 2>/dev/null | tail -n +20 | xargs -r rm -f || true
+
+# The terminal's settings, so they can be put back whatever happens to them.
+TTY_STATE=$(stty -g < /dev/tty 2>/dev/null || true)
+
+# A dropped SSH connection sends SIGHUP. Ignoring it -- here, before anything
+# is started, so everything this script starts ignores it too -- lets the run,
+# and a 45-minute Hamlib build in it, carry on to the end regardless. The log
+# records how it went.
+trap '' HUP
+
+# Everything from here goes to the screen and to the log, the log without the
+# colour codes. tee keeps writing the log if the screen goes away, and both it
+# and sed ignore Ctrl-C: they are in the same process group as everything
+# else, and if they died first the report of the interruption would go with
+# them.
+exec > >(trap '' INT TERM
+         exec tee --output-error=warn >(trap '' INT TERM
+                                        exec sed -u 's/\x1b\[[0-9;]*m//g' >> "$RUN_LOG")) 2>&1
+TEE_PID=$!
+
+RUN_DONE=0
+INTERRUPTED=0
+STOPPED_CLIENT=0
+STATION_STARTED=0
+TEMP_FILES=()
+
+on_interrupt() {
+    INTERRUPTED=1
+    printf '\n%sInterrupted.%s\n' "$C_WARN" "$C_OFF" >&2
+    exit 130
+}
+trap on_interrupt INT TERM
+
+on_exit() {
+    local rc=$?
+    trap - ERR
+    rm -f "${TEMP_FILES[@]}" 2>/dev/null || true
+    if [ -n "$TTY_STATE" ]; then stty "$TTY_STATE" < /dev/tty 2>/dev/null || true; fi
+
+    # A Mumble client stopped to make room for the Hamlib build is not left
+    # stopped because the run ended early.
+    if [ "$STOPPED_CLIENT" = 1 ] && [ "$STATION_STARTED" = 0 ]; then
+        systemctl start mumble-radio.service >/dev/null 2>&1 || true
+        printf '   restarted the Mumble client, stopped earlier for the build\n'
+    fi
+
+    if [ "$RUN_DONE" = 0 ]; then
+        if [ "$INTERRUPTED" = 1 ]; then
+            printf '   It stopped part-way. Everything it does is safe to repeat, so\n'
+            printf '   run it again to finish.\n'
+        elif [ "$rc" != 0 ] && [ "$ERR_REPORTED" = 0 ] && [ "$DIED" = 0 ]; then
+            printf '   It stopped before the end (status %s).\n' "$rc"
+        fi
+    fi
+    printf '   radio-pi-setup.sh %s; the log of this run is %s\n\n' "$VERSION" "$RUN_LOG"
+
+    # Let tee finish writing before the prompt comes back.
+    exec 1>&- 2>&-
+    wait "$TEE_PID" 2>/dev/null || true
+}
+trap on_exit EXIT
+
+ok "radio-pi-setup.sh $VERSION, logging to $RUN_LOG"
 have apt-get || die "This script is for Debian and Raspberry Pi OS (no apt-get here)."
 
 if [ "$UNATTENDED" = 0 ] && [ ! -r "$TTY_IN" ]; then
@@ -264,6 +366,7 @@ if [ -f "$CONF_FILE" ]; then
     # shellcheck source=/dev/null
     . "$CONF_FILE"
     ok "Read previous answers from $CONF_FILE"
+    note "last configured by version ${LAST_SETUP_VERSION:-0.5.0 or earlier}"
     # Runs before this one saved device names as plughw:CARD=Foo,DEV=0. That
     # comma is what Qt's QSettings turns into a list separator when Mumble
     # reads the name back, leaving it with no device at all. DEV=0 is ALSA's
@@ -292,10 +395,21 @@ fi
 # the real list of radios this Hamlib supports and the real list of sound
 # devices this Pi has.
 
+# Every apt call goes through here. Two things matter for a script:
+#   Dpkg::Use-Pty=0  apt otherwise puts the terminal into raw mode while dpkg
+#                    runs and does not always put it back, which is what made
+#                    0.5.0's output "staircase" across the screen;
+#   </dev/null and APT_LISTCHANGES_FRONTEND=none  nothing apt starts may stop
+#                    to ask a question or open a pager.
+apt_run() {
+    DEBIAN_FRONTEND=noninteractive APT_LISTCHANGES_FRONTEND=none \
+        apt-get -o Dpkg::Use-Pty=0 -o Dpkg::Options::=--force-confold "$@" < /dev/null
+}
+
 # Command-line packages: no recommends, to keep a Lite image lean.
 apt_install() {
     if [ "$SKIP_APT" = 1 ]; then note "skipping apt (--skip-apt): $*"; return 0; fi
-    DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends "$@"
+    apt_run install -y --no-install-recommends "$@"
 }
 
 # Graphical packages: recommends INCLUDED, deliberately. Mumble is a Qt
@@ -307,7 +421,7 @@ apt_install() {
 # save it.
 apt_install_gui() {
     if [ "$SKIP_APT" = 1 ]; then note "skipping apt (--skip-apt): $*"; return 0; fi
-    DEBIAN_FRONTEND=noninteractive apt-get install -y "$@"
+    apt_run install -y "$@"
 }
 
 # --------------------------------------------------------------------------
@@ -486,18 +600,34 @@ build_hamlib() {
     [ -x "$src/hamlib-$v/configure" ] ||
         die "The Hamlib $v tarball has no configure script; it cannot be built as is."
 
+    # The Mumble client, with its virtual display, is the biggest thing on
+    # the machine, and memory is what limits the build. It is stopped for the
+    # build and started again at the end -- or when the run ends, however it
+    # ends.
+    if systemctl is-active --quiet mumble-radio.service 2>/dev/null; then
+        systemctl stop mumble-radio.service
+        STOPPED_CLIENT=1
+        note "stopped    the Mumble client until the build is done, to free memory"
+        sleep 2
+    fi
+
     # Parallel compiles by memory, not by cores: a Zero 2W has four cores
-    # and 512MB, and four compilers at once can run it out.
+    # and 512MB, and four compilers at once can run it out. Measured on
+    # 4.7.2, 458 of its 469 compiles need under 60MB; the heaviest, the Yaesu
+    # backend newcat.c, peaks at 170MB. So a job per 170MB available is safe
+    # even when two of the heaviest coincide.
     mem_mb=$(awk '/MemAvailable/ {printf "%d", $2/1024}' /proc/meminfo)
-    jobs=$(( mem_mb / 200 ))
+    jobs=$(( mem_mb / 170 ))
     if [ "$jobs" -lt 1 ]; then jobs=1; fi
     if [ "$jobs" -gt "$(nproc)" ]; then jobs=$(nproc); fi
 
     log=$src/build-$v.log
-    say "building Hamlib $v with $jobs parallel job(s)."
-    say "On a Pi Zero 2W this takes 20 to 45 minutes; on a Pi 4 or 5, a few."
-    say "Progress goes to $log"
+    say "building Hamlib $v with $jobs parallel job(s), $mem_mb MB free."
+    say "On a Pi Zero 2W allow three-quarters of an hour or more; on a Pi 4 or"
+    say "5, a few minutes. It carries on if your SSH connection drops."
+    say "Progress: sudo grep -c 'Making all in' $log  (about 72 in all)"
 
+    local started=$SECONDS
     if ! (
         cd "$src/hamlib-$v" &&
         ./configure --prefix="$HAMLIB_PREFIX" --disable-static \
@@ -506,6 +636,8 @@ build_hamlib() {
         make -j"$jobs" &&
         make install
     ) > "$log" 2>&1; then
+        # An interrupted build is reported by the interrupt handler, not as a
+        # build failure; the trap runs as soon as the build returns.
         tail -25 "$log" >&2
         die "Hamlib $v did not build; the full log is $log.
        Nothing was removed: any rigctld that worked before still does."
@@ -521,6 +653,7 @@ build_hamlib() {
     fi
 
     rm -rf "${src:?}/hamlib-$v"      # the build tree; the tarball is kept
+    note "the build took $(( (SECONDS - started) / 60 )) minutes with $jobs job(s)"
     # Tarballs of versions no longer in use are only disk space.
     find "$src" -maxdepth 1 -name 'hamlib-*.tar.gz*' ! -name "hamlib-$v.tar.gz*" -delete 2>/dev/null || true
     changed "built      Hamlib $v in $HAMLIB_PREFIX"
@@ -532,16 +665,19 @@ build_hamlib() {
 remove_distro_hamlib() {
     local pkg others
     if dpkg-query -W -f='${Status}' libhamlib-utils 2>/dev/null | grep -q 'ok installed'; then
-        DEBIAN_FRONTEND=noninteractive apt-get purge -y libhamlib-utils >/dev/null 2>&1 &&
+        apt_run purge -y libhamlib-utils >/dev/null 2>&1 &&
             changed "removed    Debian's libhamlib-utils, so only one rigctld exists"
     fi
     for pkg in libhamlib4 libhamlib4t64; do
         if dpkg-query -W -f='${Status}' "$pkg" 2>/dev/null | grep -q 'ok installed'; then
+            # grep finding nothing -- the usual case, nothing else needing the
+            # library -- counts as a failure under pipefail, so it is guarded.
+            # Unguarded, this line ended version 0.5.0 without a word.
             others=$(apt-cache rdepends --installed "$pkg" 2>/dev/null | tail -n +3 |
                      sed 's/^[ |]*//' | grep -v -x -e libhamlib-utils -e "$pkg" | sort -u |
-                     tr '\n' ' ')
+                     tr '\n' ' ' || true)
             if [ -z "${others// /}" ]; then
-                DEBIAN_FRONTEND=noninteractive apt-get purge -y "$pkg" >/dev/null 2>&1 &&
+                apt_run purge -y "$pkg" >/dev/null 2>&1 &&
                     changed "removed    Debian's $pkg, which nothing else used"
             else
                 note "kept       Debian's $pkg: needed by $others"
@@ -552,7 +688,7 @@ remove_distro_hamlib() {
 
 head_ "Hamlib"
 if [ "$SKIP_APT" = 0 ]; then
-    DEBIAN_FRONTEND=noninteractive apt-get update
+    apt_run update
     apt_install alsa-utils openssl ca-certificates curl
 fi
 if have curl; then
@@ -592,7 +728,9 @@ OP_USER=$(ask "Login account for the operator" "${OP_USER:-radio}")
 
 head_ "The radio"
 
-RIGLIST=$(mktemp); trap 'rm -f "$RIGLIST"' EXIT
+# Removed by on_exit. (Its own EXIT trap here would replace on_exit, and a
+# run would end without saying how.)
+RIGLIST=$(mktemp); TEMP_FILES+=("$RIGLIST")
 "$RIGCTL_BIN" -l > "$RIGLIST" 2>/dev/null || die "rigctl -l failed."
 RIGCOUNT=$(grep -cE '^[[:space:]]*[0-9]+' "$RIGLIST" || true)
 say "Hamlib $(hamlib_installed_version) supports $RIGCOUNT radios."
@@ -872,7 +1010,8 @@ fi
 # --------------------------------------------------------------------------
 
 install_file "$CONF_FILE" 0640 root:root <<CONF
-# Answers given to radio-pi-setup.sh $VERSION.
+# Answers given to radio-pi-setup.sh.
+LAST_SETUP_VERSION="$VERSION"
 # Edit this file and re-run "sudo bash radio-pi-setup.sh --unattended"
 # to change the station without being asked the questions again.
 
@@ -1525,9 +1664,9 @@ WATCHCONF
 
     install_file /usr/local/sbin/ham-radio-pi-wifiwatch 0755 root:root <<'WIFIWATCH'
 #!/usr/bin/env bash
+# ham-radio-pi-wifiwatch  version 0.5.1  (2026-09-25)
 #
-# ham-radio-pi-wifiwatch --- keep the radio-end Pi on the network, and write
-# down why it fell off.
+# Keeps the radio-end Pi on the network, and writes down why it fell off.
 #
 # Every INTERVAL seconds it asks whether the Wi-Fi is really working: is the
 # interface there, is it joined to a network, does it have an address, does
@@ -1558,6 +1697,8 @@ WATCHCONF
 #   ham-radio-pi-wifiwatch --check    one health check, printed, then exit
 
 set -u
+
+VERSION="0.5.1"
 
 IFACE=wlan0
 INTERVAL=20                 # seconds between checks
@@ -1885,7 +2026,7 @@ main() {
     mkdir -p "$INCIDENTS" "$STATEDIR"
     local fails=0
     remember_driver
-    log "started: watching $IFACE every ${INTERVAL}s (driver ${DRIVER:-unknown}, reboot=$REBOOT)"
+    log "started: version $VERSION, watching $IFACE every ${INTERVAL}s (driver ${DRIVER:-unknown}, reboot=$REBOOT)"
     while :; do
         check
         if [ -z "$PROBLEM" ]; then
@@ -1904,8 +2045,9 @@ main() {
 case "${1:-}" in
     --report) report ;;
     --check)  check; echo "${PROBLEM:-healthy}" ;;
+    --version) echo "ham-radio-pi-wifiwatch $VERSION" ;;
     "")       main ;;
-    *)        echo "usage: $0 [--report|--check]" >&2; exit 1 ;;
+    *)        echo "usage: $0 [--report|--check|--version]" >&2; exit 1 ;;
 esac
 WIFIWATCH
 
@@ -2138,6 +2280,7 @@ systemctl restart rigctld.service || warn "rigctld did not start."
 trust_server_cert
 
 systemctl restart mumble-radio.service || warn "mumble-radio did not start."
+STATION_STARTED=1
 
 # The Mumble client waits five seconds for the server, and Mumble's Qt
 # startup on a Zero 2W is not instant.
@@ -2342,9 +2485,10 @@ $C_HEAD== Before you transmit ==$C_OFF
 
 SUMMARY7
 
+RUN_DONE=1
 if [ "$FAILED" = 1 ]; then
     warn "Some checks did not pass; see the notes above."
     exit 1
 fi
 
-printf '%s   Ready.%s\n\n' "$C_OK" "$C_OFF"
+printf '%s   Ready.%s\n' "$C_OK" "$C_OFF"

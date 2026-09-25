@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
+# radio-pi-health.sh  version 0.5.1  (2026-09-25)
 #
-# radio-pi-health.sh --- one line of vital signs, once a minute, to a file
-# that survives a lockup.
+# One line of vital signs, once a minute, to a file that survives a lockup.
 #
 # A station that fails after several hours, apparently at random, will not be
 # diagnosed by looking at it afterwards: whatever went wrong has already
@@ -19,6 +19,8 @@
 # while hunting a fault and worth undoing afterwards.
 
 set -uo pipefail
+
+VERSION="0.5.1"
 
 LOG=/var/log/ham-radio-pi-health.log
 UNIT=/etc/systemd/system/ham-radio-pi-health.service
@@ -176,6 +178,7 @@ case "${1:-}" in
     --install)   install_timer ;;
     --uninstall) uninstall_timer ;;
     --report)    report ;;
+    --version)   echo "radio-pi-health.sh $VERSION" ;;
     "")          collect >> "$LOG" 2>/dev/null || collect ;;
-    *)           echo "usage: $0 [--install|--uninstall|--report]" >&2; exit 1 ;;
+    *)           echo "usage: $0 [--install|--uninstall|--report|--version]" >&2; exit 1 ;;
 esac

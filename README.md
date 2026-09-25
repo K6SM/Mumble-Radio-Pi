@@ -52,6 +52,7 @@ uses.
 - [When it does not work](#when-it-does-not-work)
 - [What the script changes](#what-the-script-changes)
 - [What this does not do](#what-this-does-not-do)
+- [Versions](#versions)
 
 ## What you need
 
@@ -106,7 +107,7 @@ adapter.
 ## Running the script
 
 The first run is long: Hamlib is compiled from source, which on a Pi Zero 2W
-takes twenty to forty-five minutes, and then `apt` fetches Mumble. Hamlib has
+takes three-quarters of an hour or more, and then `apt` fetches Mumble. Hamlib has
 to come first, because the list of radios the script offers is that Hamlib's
 own list, so the questions come after the build. Once you have answered them
 the rest runs unattended. A re-run skips the build unless Hamlib has
@@ -115,12 +116,45 @@ published a new stable release since.
 Answers are saved in `/etc/ham-radio-pi/setup.conf`. Every file it replaces is
 copied to `/etc/ham-radio-pi/backups/` first.
 
+**Every run is logged**, in full, to
+`/var/log/ham-radio-pi/setup-<date>-<time>.log`; the newest twenty are kept. The
+last line of every run names its log. You do not need `tee`.
+
+**However a run ends, it says how.**
+
+| It ends with | Meaning |
+| --- | --- |
+| `Ready.` | It finished, and every check passed. |
+| `Some checks did not pass` | It finished; the `!` lines above say which. |
+| `Error: ...` | It stopped for a reason it understood, and says what to do. |
+| `Stopped: line N failed ...` | A command failed that it did not expect to. Nothing after that point was done. Send the log. |
+| `Interrupted.` | You pressed Ctrl-C. Everything it does is safe to repeat, so run it again to finish. |
+
+A Ctrl-C during the Hamlib build leaves the Hamlib already installed exactly
+as it was; the new one only replaces it at the very end of a successful build.
+
+**A dropped SSH connection does not stop it.** The run, and a Hamlib build in
+it, carries on to the end, and the log records how it went; reconnect and look
+at the newest file in `/var/log/ham-radio-pi/`. `tmux` is still the more
+comfortable way to run it (`sudo apt install tmux`, then `tmux new -s setup`,
+and `tmux attach -t setup` after reconnecting), because it also gives you the
+screen back.
+
+**Which version is this?**
+
+```
+head -2 radio-pi-setup.sh              # radio-pi-setup.sh  version 0.5.1
+sudo bash radio-pi-setup.sh --version
+sudo grep LAST_SETUP_VERSION /etc/ham-radio-pi/setup.conf   # which version last ran
+```
+
 | Option | |
 | --- | --- |
 | `--unattended` | Ask nothing; use the saved answers. For re-running after a software upgrade. |
 | `--reset-password` | Put the login password back to the documented default. |
 | `--skip-apt` | Change no packages and build nothing; only rewrite the configuration and restart the services. |
 | `--rebuild-hamlib` | Build Hamlib again even though the wanted version is installed. |
+| `--version` | Print the script's version and stop. |
 
 ## What it asks
 
@@ -434,8 +468,16 @@ and, optionally, the tarball's checksum as `HAMLIB_SHA256`. Set it back to
 **Upgrading is deliberate.** Nothing checks for new Hamlib releases in the
 background, and `apt upgrade` never touches this Hamlib: a new release is
 built when you re-run the script. That is on purpose &mdash; a build takes up
-to three-quarters of an hour on a Zero 2W and ends by restarting `rigctld`,
+three-quarters of an hour or more on a Zero 2W and ends by restarting `rigctld`,
 which is not something to have happen in the middle of a contact.
+
+**The build and memory.** On a Zero 2W it is memory, not the processor, that
+limits the build. The script stops the radio's Mumble client for the length of
+the build, which frees the most, and runs one compile per 170 MB free: measured
+on 4.7.2, 458 of its 469 compiles need under 60 MB, and the heaviest &mdash; the
+Yaesu backend, `newcat.c` &mdash; peaks at 170 MB. The client is started again
+afterwards, or when the run ends if it ends early. The summary reports how long
+the build took.
 
 If a build fails, the script stops and names the log
 (`/usr/local/src/hamlib/build-<version>.log`); nothing is removed, so a
@@ -918,6 +960,45 @@ transport that does not compress.
 
 **The script does not configure a firewall, a router, or a VPN.** See
 [Security](#security).
+
+## Versions
+
+Each script carries its version on its second line, so `head -2` shows it,
+and answers `--version`. Each is numbered separately from 0.5.1 on, and goes
+up whenever that script changes.
+
+| Script | Version |
+| --- | --- |
+| `radio-pi-setup.sh` | 0.5.1 |
+| `ham-radio-pi-wifiwatch` (installed by setup) | 0.5.1 |
+| `radio-pi-health.sh` | 0.5.1 |
+| `radio-pi-diagnose.sh` | 0.5.1 |
+
+### radio-pi-setup.sh 0.5.1
+
+- **Fixed:** after removing Debian's `libhamlib-utils`, the run stopped
+  without a word when nothing else needed Debian's `libhamlib4` &mdash; the
+  usual case. It left Hamlib 4.7.2 built but the `rigctld` service still
+  pointed at the removed `/usr/bin/rigctld`, and none of the later steps done.
+- **Fixed:** the output "staircased" across the screen after the first
+  package install, and could leave the terminal that way. apt no longer takes
+  over the terminal, and the terminal's settings are restored at the end.
+- **Fixed:** a Ctrl-C during the Hamlib build was reported as the build failing.
+- New: a full log of every run in `/var/log/ham-radio-pi/`.
+- New: any unexpected failure is reported with its line and command, instead
+  of the run simply ending.
+- New: a dropped SSH connection no longer stops a run.
+- New: the Mumble client is stopped during the Hamlib build to free memory,
+  and compiles run in parallel where memory allows (two on a Zero 2W instead
+  of one), which should roughly halve the build.
+- New: the version is on line 2, `--version` prints it, and `setup.conf`
+  records which version last ran.
+
+### Before 0.5.1
+
+Earlier copies all said `VERSION="1.0"` and cannot be told apart. The last
+of them (built Hamlib from source, following the latest stable release) is
+0.5.0 here.
 
 ---
 

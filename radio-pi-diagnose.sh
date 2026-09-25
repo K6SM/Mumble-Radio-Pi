@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
+# radio-pi-diagnose.sh  version 0.5.1  (2026-09-25)
 #
-# radio-pi-diagnose.sh --- why the radio's Mumble client is not connecting.
+# Why the radio's Mumble client is not connecting.
 #
 # Read-only: it changes nothing. Run it as root on the Pi, with the services
 # running, and send the whole output.
@@ -13,6 +14,9 @@
 # client is using.
 
 set -uo pipefail
+
+VERSION="0.5.1"
+if [ "${1:-}" = --version ]; then echo "radio-pi-diagnose.sh $VERSION"; exit 0; fi
 
 CONF=/etc/ham-radio-pi/setup.conf
 OP_USER=radio
@@ -28,7 +32,8 @@ OP_HOME=${OP_HOME:-/home/$OP_USER}
 rule() { printf '\n== %s ==\n' "$*"; }
 
 rule "Versions"
-mumble --version 2>&1 | head -2
+echo "radio-pi-diagnose.sh $VERSION"
+/usr/local/bin/rigctld --version 2>/dev/null | head -1 || echo "no rigctld in /usr/local"
 dpkg-query -W -f='${Package} ${Version}\n' mumble mumble-server libhamlib-utils 2>/dev/null
 
 rule "Services"
