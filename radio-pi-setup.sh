@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# radio-pi-setup.sh  version 0.5.1  (2026-09-25)
+# radio-pi-setup.sh  version 0.5.2  (2026-09-26)
 #
 # Sets up a Raspberry Pi as the radio-end computer of a remote amateur radio
 # station.
@@ -37,7 +37,7 @@
 # is reported rather than ending the script without a word.
 set -Eeuo pipefail
 
-VERSION="0.5.1"
+VERSION="0.5.2"
 CONF_DIR="/etc/ham-radio-pi"
 CONF_FILE="$CONF_DIR/setup.conf"
 BACKUP_DIR="$CONF_DIR/backups"
@@ -57,6 +57,12 @@ REBUILD_HAMLIB=0
 # time the script runs, rather than taken from Debian, whose Hamlib lags by
 # years (Bookworm ships 4.5.4).
 HAMLIB_REPO="Hamlib/Hamlib"
+
+# ham.el needs Emacs 29.1; Bookworm's own Emacs is 28.2.
+EMACS_MIN=29.1
+OS_RELEASE_FILE=/etc/os-release
+APT_SOURCES=/etc/apt/sources.list
+APT_SOURCES_D=/etc/apt/sources.list.d
 HAMLIB_PREFIX=/usr/local
 RIGCTLD_BIN=$HAMLIB_PREFIX/bin/rigctld
 RIGCTL_BIN=$HAMLIB_PREFIX/bin/rigctl
@@ -1076,7 +1082,6 @@ CONF
 if [ "$SKIP_APT" = 0 ]; then
     head_ "Installing the rest"
     PKGS=(mumble-server avahi-daemon iw rsync sqlite3)
-    if [ "$INSTALL_EMACS" = yes ];  then PKGS+=(emacs-nox); fi
     if [ "$INSTALL_K6SM" = yes ];   then PKGS+=(git); fi
     say "${PKGS[*]}"
     apt_install "${PKGS[@]}"
@@ -2080,8 +2085,75 @@ fi
 # Emacs
 # --------------------------------------------------------------------------
 
+# Prints the installed Emacs version, or nothing.
+emacs_version() {
+    if have emacs; then
+        emacs --version 2>/dev/null | awk 'NR == 1 {print $NF}' || true
+    fi
+}
+
+version_at_least() { # version_at_least <have> <want>
+    [ -n "$1" ] && [ "$(printf '%s
+' "$2" "$1" | sort -V | head -1)" = "$2" ]
+}
+
+# Emacs 29.1 is the least ham.el runs on, and Bookworm's own is 28.2. On
+# Bookworm it therefore comes from Debian's bookworm-backports: Debian's own
+# newer packages, rebuilt for Bookworm. apt takes from backports only what it
+# is asked for by name, so nothing else on the machine changes, and it keeps
+# what it took there up to date from there. Later releases carry Emacs 30 and
+# need nothing special.
+install_emacs() {
+    local codename v src=$APT_SOURCES_D/debian-backports.list
+
+    if [ "$SKIP_APT" = 1 ]; then
+        note "skipping the Emacs install (--skip-apt)"
+        return 0
+    fi
+    codename=$( . "$OS_RELEASE_FILE" 2>/dev/null; echo "${VERSION_CODENAME:-}" )
+
+    if [ "$codename" = bookworm ]; then
+        # Added only if backports is not configured already somewhere else,
+        # which would make apt complain of a duplicate source. A commented-out
+        # line does not count; a deb822 .sources file does.
+        if ! grep -rqsE --exclude="$(basename "$src")" \
+                '^[[:space:]]*(deb|Suites:).*bookworm-backports' \
+                "$APT_SOURCES" "$APT_SOURCES_D/"; then
+            if [ ! -f "$src" ]; then
+                install_file "$src" <<'BACKPORTS'
+# ham-radio-pi: Debian's backports, for Emacs 29 or later on Bookworm.
+# apt takes from here only what it is asked for by name
+# (apt install -t bookworm-backports ...), and keeps those up to date.
+deb http://deb.debian.org/debian bookworm-backports main
+BACKPORTS
+                apt_run update
+            fi
+        fi
+        # Emacs is not what the station is for: a failed install is reported
+        # below, and the rest of the setup carries on.
+        apt_run install -y --no-install-recommends -t bookworm-backports emacs-nox ||
+            warn "Installing Emacs from bookworm-backports failed."
+    else
+        apt_install emacs-nox || warn "Installing Emacs failed."
+    fi
+
+    v=$(emacs_version)
+    if version_at_least "$v" "$EMACS_MIN"; then
+        if [ "$codename" = bookworm ]; then
+            ok "emacs      $v, from bookworm-backports"
+        else
+            ok "emacs      $v"
+        fi
+    else
+        warn "Emacs is ${v:-not installed}, and ham.el needs $EMACS_MIN or later."
+        warn "M-x qso-log-form works on it; M-x ham-rig does not. The apt"
+        warn "lines above say why the newer one could not be installed."
+    fi
+}
+
 if [ "$INSTALL_EMACS" = yes ]; then
     head_ "Emacs"
+    install_emacs
     LISP_DIR="$OP_HOME/.emacs.d/lisp"
     install -d -o "$OP_USER" -g "$(id -gn "$OP_USER")" -m 0755 "$LISP_DIR"
 
@@ -2415,6 +2487,7 @@ $C_HEAD== The station ==$C_OFF
    Audio        in $AUDIO_CAPTURE
                 out $AUDIO_PLAYBACK
    Reachable at ${PI_HOSTNAME}.local${IP:+ / $IP}
+   Emacs        $( if [ "$INSTALL_EMACS" = yes ]; then emacs_version; else echo "not installed"; fi )
    Wi-Fi watch  $WIFI_WATCHDOG (last-resort reboot: $WIFI_WATCHDOG_REBOOT)
                 after an outage:  sudo ham-radio-pi-wifiwatch --report
 

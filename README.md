@@ -143,7 +143,7 @@ screen back.
 **Which version is this?**
 
 ```
-head -2 radio-pi-setup.sh              # radio-pi-setup.sh  version 0.5.1
+head -2 radio-pi-setup.sh              # radio-pi-setup.sh  version 0.5.2
 sudo bash radio-pi-setup.sh --version
 sudo grep LAST_SETUP_VERSION /etc/ham-radio-pi/setup.conf   # which version last ran
 ```
@@ -208,7 +208,9 @@ after five minutes, Bluetooth off, LEDs off, automatic login on an attached
 screen.
 
 **Emacs.** Whether to install the terminal build, and whether to fetch the
-K6SM `ham.el` and QSO logger packages from GitHub.
+K6SM `ham.el` and QSO logger packages from GitHub. On Bookworm the terminal
+build comes from Debian's backports, because the one Bookworm ships is too
+old for `ham.el`; see [Emacs 29 on Bookworm](#emacs-29-on-bookworm).
 
 ## The default password
 
@@ -400,6 +402,50 @@ daemon owns the serial port and everything else shares it.
 
 The screen blanks after five minutes and comes back on a keypress. That is
 power saving, not a screensaver; nothing is logged out.
+
+### Emacs 29 on Bookworm
+
+The `ham.el` packages need Emacs 29.1 or later. Raspberry Pi OS Bookworm
+ships Emacs 28.2, which is enough for the QSO logger (`qso.el` needs 25.1)
+but not for `ham-rig`.
+
+Debian keeps a newer Emacs for Bookworm in its official **backports**
+archive: packages from the next release, rebuilt for this one. The script
+adds that archive and installs `emacs-nox` from it:
+
+```
+/etc/apt/sources.list.d/debian-backports.list
+    deb http://deb.debian.org/debian bookworm-backports main
+```
+
+Adding backports changes nothing else on the Pi. apt never takes a package
+from backports unless it is asked for by name with `-t bookworm-backports`,
+so `apt upgrade` still upgrades everything else from Bookworm as before —
+and does keep the backported Emacs up to date, because once installed from
+there, its updates come from there. If backports is already listed (some
+images have it), the script uses that line rather than adding a second.
+
+To check:
+
+```
+emacs --version | head -1              # GNU Emacs 29.x
+apt policy emacs-nox                   # installed from bookworm-backports
+```
+
+To do the same by hand, without the script:
+
+```
+echo 'deb http://deb.debian.org/debian bookworm-backports main' \
+    | sudo tee /etc/apt/sources.list.d/debian-backports.list
+sudo apt update
+sudo apt install -t bookworm-backports emacs-nox
+```
+
+On a later Raspberry Pi OS (Trixie or newer) the normal Emacs is already 30
+or later, and the script installs that without backports.
+
+If backports cannot be reached, the script says so, installs nothing
+further, and carries on; the rest of the station does not depend on Emacs.
 
 ## Hamlib, built from source
 
@@ -892,6 +938,7 @@ with the first version kept as `.original`.
 /etc/ham-radio-pi/wifiwatch.conf              the watchdog's settings
 /usr/local/sbin/ham-radio-pi-wifiwatch
 /etc/systemd/system/ham-radio-pi-wifiwatch.service
+/etc/apt/sources.list.d/debian-backports.list Bookworm only, for Emacs 29
 ~/.config/Mumble/Mumble.conf                  the radio-end client
 ~/Documents/MumbleAutomaticCertificateBackup.p12
 ```
@@ -969,10 +1016,18 @@ up whenever that script changes.
 
 | Script | Version |
 | --- | --- |
-| `radio-pi-setup.sh` | 0.5.1 |
+| `radio-pi-setup.sh` | 0.5.2 |
 | `ham-radio-pi-wifiwatch` (installed by setup) | 0.5.1 |
 | `radio-pi-health.sh` | 0.5.1 |
 | `radio-pi-diagnose.sh` | 0.5.1 |
+
+### radio-pi-setup.sh 0.5.2
+
+- New: on Bookworm, Emacs 29 is installed from Debian's `bookworm-backports`
+  instead of Bookworm's own 28.2, which is too old for the `ham.el`
+  packages. An Emacs 28.2 already on the Pi is upgraded on the next run. See
+  [Emacs 29 on Bookworm](#emacs-29-on-bookworm).
+- New: the summary at the end shows the Emacs version.
 
 ### radio-pi-setup.sh 0.5.1
 
